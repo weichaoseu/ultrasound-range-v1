@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>超声测距 · 发射端 A</title>
+<style>
+ body{background:#0e1116;color:#dfe6ee;font-family:-apple-system,sans-serif;margin:0 auto;padding:16px;max-width:480px}
+ h1{font-size:20px}
+ .card{background:#171c24;border:1px solid #2a3240;border-radius:12px;padding:14px;margin-bottom:12px}
+ button{font-size:16px;padding:12px 14px;border-radius:10px;border:0;background:#2f6fed;color:#fff;width:100%;margin-top:8px}
+ button.sec{background:#3a4657} button:disabled{opacity:.45}
+ select,input[type=range]{font-size:16px;padding:8px;border-radius:8px;background:#0e1116;color:#dfe6ee;border:1px solid #2a3240}
+ .row{display:flex;gap:8px;align-items:center;margin-top:8px}
+ .warn{color:#ffb84d;font-size:13px;margin-top:8px}
+ .ok{color:#5ad19b}
+ pre{white-space:pre-wrap;font-size:12px;color:#8fa3bd;margin:0;max-height:220px;overflow:auto}
+</style>
+</head>
+<body>
+<h1>📡 发射端 A（伪码广播）</h1>
+<div class="card">
+  <div>状态：<span id="st" class="warn">未启动</span></div>
+  <div class="row">载波
+    <select id="fc" style="flex:1">
+      <option value="17000">17.0 kHz</option><option value="17500">17.5 kHz</option>
+      <option value="18000">18.0 kHz</option><option value="18500" selected>18.5 kHz</option>
+      <option value="19000">19.0 kHz</option><option value="19500">19.5 kHz</option>
+      <option value="20000">20.0 kHz</option>
+    </select>
+  </div>
+  <div class="row">音量 <input id="vol" type="range" min="0" max="100" value="40" style="flex:1"></div>
+  <button id="beep" class="sec">播放可听测试音（880Hz，检查扬声器链路）</button>
+  <button id="go">开始广播（连续循环 · 启动后请勿停止）</button>
+  <button id="stop" class="sec" disabled>停止（将导致需重新标定）</button>
+  <div class="warn" id="warn"></div>
+</div>
+<div class="card"><pre id="info">参数将在启动后显示</pre></div>
+
+<script>
+'use strict';
+/* ================= 与接收端必须完全一致的部分 ================= */
+const CHIP_RATE = 2000;   // 码率 2 kcps：48kHz 下每 chip 24 样本 ≈ 0.5ms ≈ 17cm 声程
+const NCHIP     = 255;    // m 序列长度（周期自相关旁瓣 = -1，近似理想图钉）
+
+function genSeq(){        // 8 级 LFSR 生成 m 序列，运行时自检周期=255
+  const sets=[[8,6,5,4],[8,6,5,3],[8,6,5,2],[8,6,4,3],[8,6,4,1],[8,6,5,1],
+              [8,5,3,1],[8,5,2,1],[8,4,3,2],[8,7,2,1],[8,7,3,2],[8,7,6,3],[8,7,6,1]];
+  for(const taps of sets){
+    const reg=new Array(9).fill(0); reg[1]=1;
+    const bits=new Array(510);
+    for(let i=0;i<510;i++){
+      let fb=0; for(const t of taps) fb^=reg[t];
+      bits[i]=reg[8];
+      for(let k=8;k>1;k--) reg[k]=reg[k-1];
+      reg[1]=fb;
+    }
+    // 排除所有真因子周期（1,3,5,15,17,51），确保本原 → 周期 255
+    const ok=[1,3,5,15,17,51].every(p=>{
+      for(let i=0;i<255;i++) if(bits[i]!==bits[i+p]) return true;
+      return false;
+    });
+    if(ok) return bits.slice(0,255);
+  }
+  throw new Error('未找到本原多项式');
+}
+const BITS = genSeq();    // bit 0 → +1，bit 1 → −1（BPSK 映射，两端一致）
+
+/* ================= 发射逻辑 ================= */
+const $ = id=>document.getElementById(id);
+let ctx=null, src=null, gain=null, t0=0, timer=null, baseInfo='';
+
+$('vol').oninput = ()=>{ if(gain) gain.gain.value = $('vol').value/100*0.8; };
+
+$('beep').onclick = async ()=>{           // 可听测试音：确认音量/扬声器正常
+  if(!ctx) ctx = new (window.AudioContext||window.webkitAudioContext)();
+  await ctx.resume();
+  const o=ctx.createOscillator(), g=ctx.createGain();
+  o.frequency.value=880; g.gain.value=0.2;
+  o.connect(g).connect(ctx.destination); o.start();
+  setTimeout(()=>o.stop(),500);
+};
+
+$('go').onclick = async ()=>{
+  try{
+    try{ ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000,latencyHint:'playback'}); }
+    catch(e){ ctx=new (window.AudioContext||window.webkitAudioContext)(); } // playback→大缓冲、延迟稳定
+    await ctx.resume();
+    const fs=ctx.sampleRate, N=Math.round(fs*NCHIP/CHIP_RATE), fc=parseFloat($('fc').value);
+
+    // 生成一个周期波形：BPSK = chip符号 × cos(2π·fc·t)，循环播放 = 伪码无限重复
+    const buf=ctx.createBuffer(1,N,fs), d=buf.getChannelData(0);
+    for(let n=0;n<N;n++){
+      const k=Math.min(NCHIP-1, Math.floor(n*CHIP_RATE/fs)); // 本周期内 chip 序号
+      const sg = BITS[k]===0 ? 1 : -1;
+      d[n]=sg*Math.cos(2*Math.PI*fc*n/fs);
+    }
+    src=ctx.createBufferSource(); src.buffer=buf; src.loop=true;
+    gain=ctx.createGain(); gain.gain.value=$('vol').value/100*0.8;
+    src.connect(gain).connect(ctx.destination);
+    src.start();                          // ★ 只启动这一次：此后码元节拍由晶振锁定，
+    t0=Date.now();                        //   播放延迟冻结为常数 → 被标定吸收
+
+    $('st').textContent='广播中（连续循环）'; $('st').className='ok';
+    $('go').disabled=true; $('fc').disabled=true; $('stop').disabled=false;
+    $('warn').textContent='⚠️ 本会话请勿停止/重启/切换载波，否则接收端必须重新标定';
+    baseInfo=`PN码: 255 chip m-序列（周期自检通过）\n码率: ${CHIP_RATE} Hz（1 chip ≈ 17 cm 声程）\n`
+            +`载波: ${fc} Hz\nfs: ${fs} Hz\n周期: ${(N/fs*1000).toFixed(2)} ms（N=${N} 样本）\n`
+            +`无模糊窗: ±${(343*N/fs/2).toFixed(1)} m`;
+    $('info').textContent=baseInfo;
+    timer=setInterval(()=>{ $('info').textContent=baseInfo+'\n已广播: '+((Date.now()-t0)/1000|0)+' s'; },1000);
+    if(navigator.wakeLock) navigator.wakeLock.request('screen').catch(()=>{});
+  }catch(e){ $('st').textContent='启动失败: '+e.message; }
+};
+
+$('stop').onclick=()=>{
+  try{src.stop();}catch(e){}
+  clearInterval(timer);
+  $('st').textContent='已停止（重启后需重新标定）'; $('st').className='warn';
+  $('go').disabled=false; $('stop').disabled=true;
+};
+</script>
+</body>
+</html>

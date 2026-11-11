@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>超声测距 · 接收端 B</title>
+<style>
+ body{background:#0e1116;color:#dfe6ee;font-family:-apple-system,sans-serif;margin:0 auto;padding:16px;max-width:480px}
+ h1{font-size:20px}
+ .card{background:#171c24;border:1px solid #2a3240;border-radius:12px;padding:14px;margin-bottom:12px}
+ button{font-size:15px;padding:10px 12px;border-radius:10px;border:0;background:#2f6fed;color:#fff}
+ button.sec{background:#3a4657} button:disabled{opacity:.45}
+ select,input{font-size:15px;padding:6px;border-radius:8px;background:#0e1116;color:#dfe6ee;border:1px solid #2a3240}
+ .row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+ .warn{color:#ffb84d;font-size:13px;margin-top:6px}
+ .ok{color:#5ad19b}
+ .big{font-size:34px;color:#5ad19b;margin:6px 0;font-variant-numeric:tabular-nums}
+ #sub{font-size:12px;color:#8fa3bd}
+ #calInfo{font-size:12px;color:#8fa3bd;margin-top:6px}
+ pre{white-space:pre-wrap;font-size:11px;color:#8fa3bd;max-height:200px;overflow:auto;margin:0}
+ canvas{width:100%;display:block}
+ .lbl{font-size:11px;color:#5a6b82;margin-top:4px}
+</style>
+</head>
+<body>
+<h1>🎧 接收端 B（相关测距）</h1>
+
+<div class="card">
+  <div>状态：<span id="st" class="warn">未启动</span></div>
+  <div class="big" id="dist">--</div>
+  <div id="sub">φ=-- | SNR=-- | fs=--</div>
+  <div class="warn" id="warn"></div>
+  <div class="row">
+    <button id="mic">启动监听（授权麦克风）</button>
+  </div>
+  <div class="row">载波
+    <select id="fc" style="flex:1">
+      <option value="17000">17.0k</option><option value="17500">17.5k</option>
+      <option value="18000">18.0k</option><option value="18500" selected>18.5k</option>
+      <option value="19000">19.0k</option><option value="19500">19.5k</option>
+      <option value="20000">20.0k</option>
+    </select>
+    <button id="scan" class="sec">探测最佳载波</button>
+  </div>
+</div>
+
+<div class="card">
+  <b>标定</b>（d₁ 直接填卷尺量出的距离）
+  <div class="row">参考距离 d₁ <input id="d1" type="number" value="1.5" step="0.01" style="width:80px"> m
+    <button id="cal1" class="sec">① 单点标定</button></div>
+  <div class="row">两点: d₁ <input id="d1b" type="number" value="0.5" step="0.01" style="width:64px">
+    d₂ <input id="d2b" type="number" value="3" step="0.01" style="width:64px"> m
+    <button id="p1" class="sec">采点1</button><button id="p2" class="sec">采点2</button></div>
+  <div class="row"><button id="recheck" class="sec" style="flex:1">复核（移回参考点后按）</button></div>
+  <div id="calInfo">未标定 — 距离读数不可用</div>
+</div>
+
+<div class="card"><canvas id="trend" height="150"></canvas>
+  <div class="lbl">距离趋势（最近 60 s，虚线=参考点距离）</div></div>
+<div class="card"><canvas id="prof" height="110"></canvas>
+  <div class="lbl">本块相关峰附近 ±2 ms（红线=峰值，虚线=噪底；右侧小峰=多径）</div></div>
+
+<pre id="log"></pre>
+
+<script>
+'use strict';
+/* ============ 与发射端必须完全一致：PN 序列 + 参数 ============ */
+const CHIP_RATE=2000, NCHIP=255;
+const $=id=>document.getElementById(id);
+const log=(...a)=>{const t=new Date().toTimeString().slice(0,8);
+  $('log').textContent=`[${t}] ${a.join(' ')}\n`+$('log').textContent.substring(0,3000);};
+const median=a=>{if(!a.length)return 0;const b=[...a].sort((x,y)=>x-y),n=b.length;
+  return n&1?b[(n-1)/2]:(b[n/2-1]+b[n/2])/2;};
+function wrapPM(x,T){let y=x%T;if(y<0)y+=T;if(y>T/2)y-=T;return y;} // 折到(-T/2,T/2]
+
+function genSeq(){ // 与 tx.html 逐字相同
+  const sets=[[8,6,5,4],[8,6,5,3],[8,6,5,2],[8,6,4,3],[8,6,4,1],[8,6,5,1],
+              [8,5,3,1],[8,5,2,1],[8,4,3,2],[8,7,2,1],[8,7,3,2],[8,7,6,3],[8,7,6,1]];
+  for(const taps of sets){
+    const reg=new Array(9).fill(0);reg[1]=1;const bits=new Array(510);
+    for(let i=0;i<510;i++){let fb=0;for(const t of taps)fb^=reg[t];
+      bits[i]=reg[8];for(let k=8;k>1;k--)reg[k]=reg[k-1];reg[1]=fb;}
+    const ok=[1,3,5,15,17,51].every(p=>{
+      for(let i=0;i<255;i++)if(bits[i]!==bits[i+p])return true;return false;});
+    if(ok)return bits.slice(0,255);
+  }
+  throw new Error('未找到本原多项式');
+}
+const BITS=genSeq();
+log('PN 码自检通过：255 chip m-序列');
+
+/* ============ 本地副本（复数：cos/sin 两条，|C| 对载波相位免疫） ============ */
+let PER=null, rep2C=null, rep2S=null, fc=18500;
+function buildReplica(fs,f){
+  const N=Math.round(fs*NCHIP/CHIP_RATE);
+  const baseC=new Float32Array(N), baseS=new Float32Array(N);
+  for(let n=0;n<N;n++){
+    const k=Math.min(NCHIP-1,Math.floor(n*CHIP_RATE/fs));
+    const sg=BITS[k]===0?1:-1, ph=2*Math.PI*f*n/fs;
+    baseC[n]=sg*Math.cos(ph); baseS[n]=sg*Math.sin(ph);
+  }
+  rep2C=new Float32Array(2*N); rep2S=new Float32Array(2*N); // 双倍长 = 环形相关
+  rep2C.set(baseC,0); rep2C.set(baseC,N);
+  rep2S.set(baseS,0); rep2S.set(baseS,N);
+  PER={N, T:N/fs, fs};
+}
+
+/* ============ 麦克风：AudioWorklet 按 码周期 切块（即到即用） ============ */
+const WORKLET=`class Acc extends AudioWorkletProcessor{
+ constructor(){super();this.N=Math.round(sampleRate*255/2000);
+  this.buf=new Float32Array(this.N);this.fill=0;}
+ process(inputs){const ch=inputs[0]&&inputs[0][0];if(!ch)return true;let i=0;
+  while(i<ch.length){const need=this.N-this.fill;const take=Math.min(need,ch.length-i);
+   this.buf.set(ch.subarray(i,i+take),this.fill);this.fill+=take;i+=take;
+   if(this.fill===this.N){const out=this.buf.slice();
+    this.port.postMessage(out,[out.buffer]);this.fill=0;}}
+  return true;}}
+registerProcessor('acc',Acc);`;
+
+let queue=[], busy=false, latestBlock=null;
+function enqueue(b){queue.push(b);if(queue.length>3)queue.shift();pump();} // 丢旧块无损失（码周期可再生）
+function pump(){if(busy)return;busy=true;
+  while(queue.length){try{processBlock(queue.shift());}catch(e){log('ERR '+e.message);}}
+  busy=false;}
+
+$('mic').onclick=async()=>{
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{
+      echoCancellation:false, noiseSuppression:false,   // ★ 必须：否则AEC会把超声当回声吃掉
+      autoGainControl:false, channelCount:1}});
+    try{ctx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});}
+    catch(e){ctx=new (window.AudioContext||window.webkitAudioContext)();}
+    await ctx.resume();
+    fc=parseFloat($('fc').value);
+    buildReplica(ctx.sampleRate,fc);
+    const srcN=ctx.createMediaStreamSource(stream);
+    let ok=false;
+    try{
+      const url=URL.createObjectURL(new Blob([WORKLET],{type:'application/javascript'}));
+      await ctx.audioWorklet.addModule(url);
+      const node=new AudioWorkletNode(ctx,'acc');
+      node.port.onmessage=e=>enqueue(e.data);
+      srcN.connect(node); ok=true;                       // 不连扬声器，避免啸叫
+      log(`AudioWorklet 就绪，块长 N=${PER.N}`);
+    }catch(e){log('AudioWorklet 不可用('+e.message+')，退回 ScriptProcessor');}
+    if(!ok){
+      const sp=ctx.createScriptProcessor(4096,1,1);
+      const acc=new Float32Array(PER.N); let fill=0;
+      sp.onaudioprocess=ev=>{const ch=ev.inputBuffer.getChannelData(0);let i=0;
+        while(i<ch.length){const take=Math.min(PER.N-fill,ch.length-i);
+          acc.set(ch.subarray(i,i+take),fill);fill+=take;i+=take;
+          if(fill===PER.N){enqueue(acc.slice());fill=0;}}};
+      const mute=ctx.createGain(); mute.gain.value=0;
+      srcN.connect(sp); sp.connect(mute).connect(ctx.destination);
+    }
+    $('st').textContent='监听中 — 捕获信号…'; $('st').className='ok';
+    $('mic').disabled=true;
+    if(navigator.wakeLock) navigator.wakeLock.request('screen').catch(()=>{});
+  }catch(e){$('st').textContent='麦克风失败:'+e.message+'（需 HTTPS/localhost）';}
+};
+
+/* ============ 相关：捕获（全范围）→ 跟踪（±2ms 窗） ============ */
+let locked=false, lastM=0, loseCnt=0, lastRes=null;
+let calib=null, p1Tau=null, dHist=[], trend=[], capture=null;
+
+function correlateRange(rx,lo,hi){        // 环形互相关：C[m]=Σ rx[n]·rep[(n-m)mod N]
+  const N=PER.N,R=rep2C,S=rep2S,cnt=hi-lo+1;
+  const mags=new Float32Array(cnt); let best=0,bestV=-1;
+  for(let m=lo;m<=hi;m++){
+    const off=N-m; let cr=0,ci=0;
+    for(let n=0;n<N;n++){const x=rx[n]; cr+=x*R[off+n]; ci+=x*S[off+n];}
+    const v=Math.sqrt(cr*cr+ci*ci); mags[m-lo]=v;
+    if(v>bestV){bestV=v;best=m-lo;}
+  }
+  return {mags,best,bestV,lo};
+}
+function floorOf(mags,best,halfW){const a=[];
+  for(let i=0;i<mags.length;i++)if(Math.abs(i-best)>halfW)a.push(mags[i]);
+  return median(a);}
+function fullAcquire(rx){const r=correlateRange(rx,0,PER.N-1);
+  return Object.assign(r,{floor:floorOf(r.mags,r.best,48)});}
+function trackAround(rx,mc){const W=96,
+  lo=Math.max(0,mc-W),hi=Math.min(PER.N-1,mc+W);
+  const r=correlateRange(rx,lo,hi);
+  return Object.assign(r,{floor:floorOf(r.mags,r.best,48)});}
+function parab(mags,i){if(i<=0||i>=mags.length-1)return 0;
+  const a=mags[i-1],b=mags[i],c=mags[i+1],den=a-2*b+c;
+  if(Math.abs(den)<1e-12)return 0;
+  return Math.max(-0.5,Math.min(0.5,0.5*(a-c)/den));}   // 抛物线插值 → 亚样本峰位
+
+function processBlock(rx){
+  const N=PER.N; latestBlock=rx;
+  let mean=0; for(let i=0;i<N;i++)mean+=rx[i]; mean/=N;
+  for(let i=0;i<N;i++)rx[i]-=mean;                       // 去直流
+  const res=locked?trackAround(rx,lastM):fullAcquire(rx);
+  const mFloat=res.lo+res.best+parab(res.mags,res.best);
+  const tau=mFloat/PER.fs;                               // 码相位（秒，mod T）
+  lastM=((Math.round(mFloat))%N+N)%N;
+  const snr=20*Math.log10(Math.max(res.peak,1e-9)/Math.max(res.floor,1e-9));
+  const atEdge=res.best===0||res.best===res.mags.length-1;
+  if(locked&&(atEdge||snr<8))loseCnt++; else if(snr>=8)loseCnt=0;
+  if(loseCnt>=3){locked=false;loseCnt=0;log('失锁 → 重新全范围捕获');}
+  if(!locked&&snr>=12){locked=true;
+    log(`捕获锁定 φ=${(tau*1e3).toFixed(3)}ms SNR=${snr.toFixed(1)}dB`);}
+  lastRes=res;
+  handleCapture(tau,snr);
+  updateReadout(tau,snr);
+  drawProf(); drawTrend();
+}
+
+/* ============ 标定状态机 ============ */
+$('cal1').onclick=()=>beginCapture('cal1');
+$('p1').onclick  =()=>beginCapture('p1');
+$('p2').onclick  =()=>beginCapture('p2');
+$('recheck').onclick=()=>beginCapture('recheck');
+
+function beginCapture(mode){
+  if(!locked){log('尚未锁定信号');return;}
+  if(mode==='p2'&&p1Tau==null){log('请先采点1');return;}
+  if(mode==='recheck'&&!calib){log('尚未标定');return;}
+  capture={mode,arr:[]};
+  log(`开始采集「${mode}」，保持静止约 1.5 s…`);
+}
+function handleCapture(tau,snr){
+  if(!capture||snr<12)return;
+  capture.arr.push(tau);
+  $('st').textContent=`采集中 ${capture.arr.length}/12`;
+  if(capture.arr.length>=12){const m=capture.mode,phi=median(capture.arr);
+    capture=null; finishCapture(m,phi);}
+}
+function finishCapture(mode,phi){
+  const T=PER.T;
+  if(mode==='cal1'){
+    const d=parseFloat($('d1').value);
+    if(!(d>0)){log('d₁ 无效');return;}
+    // τ_sys = φ_cal − d_cal/c ：用已知量解掉全部系统偏移（单点，声速取 343）
+    calib={mode:'single',cEff:343,tauSys:((phi-d/343)%T+T)%T,dRef:d,since:Date.now()};
+    log(`单点标定完成 φ₁=${(phi*1e3).toFixed(3)}ms τ_sys=${(calib.tauSys*1e3).toFixed(3)}ms`);
+  }else if(mode==='p1'){
+    p1Tau=phi; log(`点1完成 φ₁=${(phi*1e3).toFixed(3)}ms，请移到 d₂ 处按「采点2」`);
+  }else if(mode==='p2'){
+    const d1=parseFloat($('d1b').value),d2=parseFloat($('d2b').value);
+    if(!(d2>d1)){log('需 d₂>d₁');return;}
+    const dphi=wrapPM(phi-p1Tau,T);
+    if(dphi<0.0015){log(`两点相位差过小(${(dphi*1e3).toFixed(2)}ms)`);return;}
+    const c=(d2-d1)/dphi;                                // 两点联立解出有效声速
+    if(c<300||c>400){log(`有效声速异常 ${c.toFixed(1)} m/s，标定拒绝`);return;}
+    calib={mode:'two',cEff:c,tauSys:((p1Tau-d1/c)%T+T)%T,dRef:d1,since:Date.now()};
+    log(`两点标定完成 c_eff=${c.toFixed(2)}m/s τ_sys=${(calib.tauSys*1e3).toFixed(3)}ms`);
+  }else if(mode==='recheck'){
+    const dNow=calib.cEff*wrapPM(phi-calib.tauSys,T);
+    const drift=(dNow-calib.dRef)*1000;
+    log(`复核：测得 ${dNow.toFixed(3)}m，偏差 ${drift.toFixed(1)}mm`+
+        (Math.abs(drift)>15?'（偏大，建议重新标定）':'（正常）'));
+  }
+  dHist=[]; trend=[];
+  $('st').textContent=locked?'监听中 — 已锁定':'监听中';
+}
+
+/* ============ 读数与图表 ============ */
+function updateReadout(tau,snr){
+  $('sub').textContent=`φ=${(tau*1e3).toFixed(3)}ms | SNR=${snr.toFixed(1)}dB | `+
+    `fc=${fc}Hz | fs=${PER.fs}Hz | ${locked?'已锁定':'搜索中'}`;
+  if(!calib){$('dist').textContent='--（未标定）';return;}
+  const dRaw=calib.cEff*wrapPM(tau-calib.tauSys,PER.T);   // d = c_eff · (φ−τ_sys)
+  dHist.push(dRaw); if(dHist.length>5)dHist.shift();
+  const d=median(dHist);
+  if(d<0||d>25){$('dist').textContent='超出范围';
+    $('warn').textContent='超出无模糊窗（±21.9m）或未对准发射端';}
+  else{$('dist').textContent=d.toFixed(3)+' m';$('warn').textContent='';}
+  $('calInfo').textContent=`${calib.mode==='single'?'单点':'两点'}标定 | `+
+    `c_eff=${calib.cEff.toFixed(1)}m/s | τ_sys=${(calib.tauSys*1e3).toFixed(2)}ms | `+
+    `参考 ${calib.dRef.toFixed(2)}m | ${((Date.now()-calib.since)/1000|0)}s 前`;
+  trend.push({t:Date.now(),d}); if(trend.length>600)trend.shift();
+}
+function setupCv(cv){const r=devicePixelRatio||1,w=cv.clientWidth,h=cv.clientHeight;
+  if(cv.width!==Math.round(w*r)){cv.width=Math.round(w*r);cv.height=Math.round(h*r);}
+  const g=cv.getContext('2d');g.setTransform(r,0,0,r,0,0);return g;}
+function drawProf(){
+  const cv=$('prof'),g=setupCv(cv),w=cv.clientWidth,h=cv.clientHeight;
+  g.clearRect(0,0,w,h); if(!lastRes)return;
+  const m=lastRes.mags,pk=lastRes.peak,fl=lastRes.floor,n=m.length;
+  g.strokeStyle='#2fd08a';g.beginPath();
+  for(let i=0;i<n;i++){const x=i/(n-1)*w,y=h-4-(m[i]/pk)*(h-12);
+    i?g.lineTo(x,y):g.moveTo(x,y);}
+  g.stroke();
+  const yF=h-4-(fl/pk)*(h-12);
+  g.strokeStyle='#5a6b82';g.setLineDash([4,4]);
+  g.beginPath();g.moveTo(0,yF);g.lineTo(w,yF);g.stroke();g.setLineDash([]);
+  const xp=lastRes.best/(n-1)*w;
+  g.strokeStyle='#ff6b6b';g.beginPath();g.moveTo(xp,0);g.lineTo(xp,h);g.stroke();
+}
+function drawTrend(){
+  const cv=$('trend'),g=setupCv(cv),w=cv.clientWidth,h=cv.clientHeight;
+  g.clearRect(0,0,w,h);
+  const t0=Date.now()-60000, pts=trend.filter(p=>p.t>=t0);
+  if(pts.length<2)return;
+  let lo=Math.min(...pts.map(p=>p.d)),hi=Math.max(...pts.map(p=>p.d));
+  if(calib){lo=Math.min(lo,calib.dRef);hi=Math.max(hi,calib.dRef);}
+  const pad=Math.max(0.05,(hi-lo)*0.15); lo-=pad; hi+=pad;
+  const X=t=>(t-t0)/60000*w, Y=d=>h-((d-lo)/(hi-lo))*h;
+  if(calib){const y=Y(calib.dRef);
+    g.strokeStyle='#3a4657';g.setLineDash([5,5]);
+    g.beginPath();g.moveTo(0,y);g.lineTo(w,y);g.stroke();g.setLineDash([]);
+    g.fillStyle='#5a6b82';g.font='10px sans-serif';
+    g.fillText('参考 '+calib.dRef.toFixed(2)+'m',4,y-3);}
+  g.strokeStyle='#2fd08a';g.beginPath();
+  pts.forEach((p,i)=>{i?g.lineTo(X(p.t),Y(p.d)):g.moveTo(X(p.t),Y(p.d));});
+  g.stroke();
+  g.fillStyle='#5a6b82';g.fillText('距离 m（60s）',4,12);
+}
+
+/* ============ 载波探测（Goertzel 能量扫描 16–21kHz） ============ */
+function goertzel(rx,f){
+  const fs=PER.fs,w=2*Math.PI*f/fs,cw=Math.cos(w),sw=Math.sin(w);
+  let c1=1,s1=0,re=0,im=0;
+  for(let n=0;n<rx.length;n++){const x=rx[n];
+    re+=x*c1; im-=x*s1;
+    const c2=c1*cw-s1*sw, s2=c1*sw+s1*cw; c1=c2; s1=s2;}
+  return re*re+im*im;
+}
+function setCarrier(f){
+  fc=f; if(PER)buildReplica(PER.fs,f);
+  locked=false; loseCnt=0;
+  if(calib){calib=null;dHist=[];trend=[];
+    $('calInfo').textContent='载波已变更，请重新标定';$('dist').textContent='--';}
+  log(`载波 → ${f} Hz，重新捕获…`);
+}
+$('fc').onchange=()=>setCarrier(parseFloat($('fc').value));
+$('scan').onclick=()=>{
+  if(!latestBlock||!PER){log('暂无数据，请先启动监听');return;}
+  let best=fc,bv=-1;
+  for(let f=16000;f<=21000;f+=500){const v=goertzel(latestBlock,f);
+    if(v>bv){bv=v;best=f;}}
+  log(`探测结果：最佳载波 ${best} Hz`);
+  $('fc').value=String(best); setCarrier(best);
+};
+</script>
+</body>
+</html>
