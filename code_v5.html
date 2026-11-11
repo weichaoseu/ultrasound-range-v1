@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>声学差分测距仪 (Differential Acoustic Ranging)</title>
+    <title>声学差分测距仪 (稳定防抖版)</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 15px; background: #0f172a; color: #f8fafc; }
         .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 15px; border: 1px solid #334155; }
@@ -11,81 +11,101 @@
         .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; margin-top: 8px; }
         .btn-primary { background: #0284c7; color: white; }
         .btn-success { background: #16a34a; color: white; }
-        .btn-warning { background: #d97706; color: white; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         input { width: 100%; padding: 10px; background: #0f172a; border: 1px solid #475569; color: white; border-radius: 6px; box-sizing: border-box; font-size: 1rem; }
-        label { display: block; margin-bottom: 4px; }
         .metric-title { font-size: 0.85rem; color: #94a3b8; }
         .metric-value { font-size: 2.2rem; font-weight: bold; color: #38bdf8; margin: 5px 0; }
-        canvas { width: 100%; height: 130px; background: #090d16; border-radius: 6px; margin-top: 10px; }
-        .status { padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; display: inline-block; }
-        .status-off { background: #475569; }
-        .status-on { background: #16a34a; }
-        .step-box { background: #0f172a; padding: 12px; border-radius: 8px; border: 1px dashed #475569; margin-top: 10px; }
+        canvas { width: 100%; height: 120px; background: #090d16; border-radius: 6px; margin-top: 10px; }
+        .status { padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; display: inline-block; font-weight: bold; }
+        .status-off { background: #475569; color: #cbd5e1; }
+        .status-on { background: #16a34a; color: white; }
+        .step-box { background: #0f172a; padding: 12px; border-radius: 8px; border: 1px solid #334155; margin-top: 10px; }
     </style>
 </head>
 <body>
 
+    <!-- 1. 模式选择 -->
     <div class="card">
-        <h2>模式选择 & 启动</h2>
+        <h2>1. 硬件模式选择</h2>
         <div class="grid">
-            <button class="btn btn-primary" id="startTxBtn">发射端 (播放PRN)</button>
-            <button class="btn btn-primary" id="startRxBtn">接收端 (麦克风测距)</button>
+            <button class="btn btn-primary" id="txToggleBtn">开启发射端 (播放声波)</button>
+            <button class="btn btn-primary" id="rxSelectBtn">切换至接收端界面</button>
         </div>
         <div style="margin-top: 10px;">
-            运行状态: <span id="sysStatus" class="status status-off">未初始化</span>
+            发射状态: <span id="txStatus" class="status status-off">未开启</span>
         </div>
     </div>
 
-    <!-- 接收端控制与校准面板 -->
+    <!-- 2. 接收端控制面板 -->
     <div class="card" id="rxPanel" style="display: none;">
-        <h2>差分测距与校准控制台</h2>
+        <h2>2. 接收端测量与标定</h2>
         
+        <!-- 开始 / 结束控制按钮 -->
+        <div class="grid" style="margin-bottom: 12px;">
+            <button class="btn btn-success" id="startRxBtn">▶ 开始测量</button>
+            <button class="btn btn-danger" id="stopRxBtn" disabled>⏹ 停止测量</button>
+        </div>
+        <div style="margin-bottom: 12px;">
+            接收状态: <span id="rxStatus" class="status status-off">未启动</span>
+            <span id="signalQuality" style="font-size: 0.85rem; margin-left: 10px; color: #94a3b8;">信号强度: --</span>
+        </div>
+
+        <!-- 温度设置 -->
         <div class="grid" style="margin-bottom: 12px;">
             <div>
                 <label class="metric-title">环境温度 (°C)</label>
                 <input type="number" id="tempInput" value="25" step="1">
             </div>
             <div>
-                <label class="metric-title">当前声速 c (m/s)</label>
+                <label class="metric-title">当前声速 (m/s)</label>
                 <input type="text" id="soundSpeedDisplay" value="346.3" readonly style="color: #38bdf8; background: #111827;">
             </div>
         </div>
 
-        <!-- 步骤一：校准距离设置 -->
+        <!-- 校准步骤 -->
         <div class="step-box">
-            <label style="font-weight: bold; color: #38bdf8;">步骤 1：已知校准距离设定 (d0)</label>
-            <div class="metric-title" style="margin-bottom: 6px;">用卷尺量好手机A到B的初始距离，填入下方：</div>
+            <label style="font-weight: bold; color: #38bdf8;">标定基准距离 (d0)</label>
+            <div class="metric-title" style="margin-bottom: 6px;">输入卷尺测得的已知距离后点击锁定：</div>
             <div style="display: flex; gap: 10px; align-items: center;">
                 <input type="number" id="d0Input" value="1.000" step="0.001" style="flex: 2;">
                 <span style="flex: 1; font-weight: bold;">米 (m)</span>
             </div>
-            <button class="btn btn-success" id="calibrateBtn" style="margin-top: 10px;">🔒 锁定当前位置为基准 (记录 t0)</button>
-            <div id="calibStatus" style="font-size: 0.85rem; color: #f59e0b; margin-top: 6px;">状态：尚未标定 (请先放置于已知距离并点击锁定)</div>
+            <button class="btn btn-primary" id="calibrateBtn" style="margin-top: 10px;" disabled>🔒 锁定当前位置为 t0</button>
+            <div id="calibStatus" style="font-size: 0.85rem; color: #f59e0b; margin-top: 6px;">状态：尚未标定</div>
         </div>
 
-        <!-- 步骤二：实时测量结果 -->
-        <div class="step-box" style="margin-top: 15px; text-align: center; border-style: solid; border-color: #334155;">
-            <div class="metric-title">步骤 2：待测距离实时解算 (d)</div>
+        <!-- 实时数值展示 -->
+        <div class="step-box" style="margin-top: 15px; text-align: center;">
+            <div class="metric-title">实时测量距离 (d)</div>
             <div class="metric-value" id="distDisplay">--.--- m</div>
             <div id="deltaDisplay" style="font-size: 0.95rem; color: #10b981;">相对位移 Δd: -- mm</div>
         </div>
 
         <div style="margin-top: 15px;">
-            <span class="metric-title">互相关能量峰与延迟监控:</span>
+            <span class="metric-title">互相关峰值波形 (监测信号完整度):</span>
             <canvas id="corrCanvas"></canvas>
         </div>
     </div>
 
 <script>
 const FS = 48000;          // 采样率
-const CARRIER_FREQ = 18000;// 载波频率 18kHz
-const CHIP_RATE = 2000;    // 码元速率 2000 chips/s
-const PRN_LEN = 63;        // 6阶m序列长度 63
-let audioCtx = null;
-let t0_samples = null;     // 校准时的基准延迟点数 ($t_0$)
+const CARRIER_FREQ = 18000;// 载波 18kHz
+const CHIP_RATE = 2000;    // 码率 2000 chips/s
+const PRN_LEN = 63;        // m序列长度
+
+let txAudioCtx = null, rxAudioCtx = null;
+let txSourceNode = null;
+let rxMediaStream = null, rxProcessorNode = null;
+
+let t0_samples = null;
 let soundSpeed = 346.3;
+
+// 防抖滤波缓冲区 (滑动窗口)
+const FILTER_WINDOW_SIZE = 7;
+let peakHistory = [];
+let smoothPeak = null;
 
 // 生成 m 序列
 function generateMSequence() {
@@ -99,7 +119,7 @@ function generateMSequence() {
     return seq;
 }
 
-// 调制 PRN 为 BPSK 音频 Buffer
+// 构造 PRN 信号
 function createPRNAudioBuffer(ctx) {
     const mSeq = generateMSequence();
     const samplesPerChip = Math.floor(FS / CHIP_RATE);
@@ -115,55 +135,81 @@ function createPRNAudioBuffer(ctx) {
     return buffer;
 }
 
-// 实时更新声速
-function updateSoundSpeed() {
+// 温度/声速联动
+document.getElementById('tempInput').oninput = () => {
     const temp = parseFloat(document.getElementById('tempInput').value) || 25;
     soundSpeed = 331.3 + 0.6 * temp;
     document.getElementById('soundSpeedDisplay').value = soundSpeed.toFixed(1) + ' m/s';
-}
-document.getElementById('tempInput').oninput = updateSoundSpeed;
-updateSoundSpeed();
-
-// ---------------- 发射端逻辑 ----------------
-document.getElementById('startTxBtn').onclick = async () => {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: FS });
-    await audioCtx.resume();
-    const buffer = createPRNAudioBuffer(audioCtx);
-    const src = audioCtx.createBufferSource();
-    src.buffer = buffer;
-    src.loop = true;
-    src.connect(audioCtx.destination);
-    src.start();
-    document.getElementById('sysStatus').className = 'status status-on';
-    document.getElementById('sysStatus').innerText = '发射端运行中 (循环播放 18kHz PRN)';
 };
 
-// ---------------- 接收端逻辑 ----------------
-document.getElementById('startRxBtn').onclick = async () => {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: FS });
-    await audioCtx.resume();
+// ---------------- 1. 发射端控制 (开关逻辑) ----------------
+let isTxRunning = false;
+document.getElementById('txToggleBtn').onclick = async () => {
+    if (!isTxRunning) {
+        txAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: FS });
+        await txAudioCtx.resume();
+        const buffer = createPRNAudioBuffer(txAudioCtx);
+        txSourceNode = txAudioCtx.createBufferSource();
+        txSourceNode.buffer = buffer;
+        txSourceNode.loop = true;
+        txSourceNode.connect(txAudioCtx.destination);
+        txSourceNode.start();
+        
+        isTxRunning = true;
+        document.getElementById('txToggleBtn').innerText = '关闭发射端';
+        document.getElementById('txStatus').className = 'status status-on';
+        document.getElementById('txStatus').innerText = '发射中 (18kHz)';
+    } else {
+        if (txSourceNode) txSourceNode.stop();
+        if (txAudioCtx) txAudioCtx.close();
+        isTxRunning = false;
+        document.getElementById('txToggleBtn').innerText = '开启发射端 (播放声波)';
+        document.getElementById('txStatus').className = 'status status-off';
+        document.getElementById('txStatus').innerText = '未开启';
+    }
+};
+
+document.getElementById('rxSelectBtn').onclick = () => {
+    document.getElementById('rxPanel').style.display = 'block';
+};
+
+// ---------------- 2. 接收端控制 (开始/结束/滤波) ----------------
+const startRxBtn = document.getElementById('startRxBtn');
+const stopRxBtn = document.getElementById('stopRxBtn');
+const calibrateBtn = document.getElementById('calibrateBtn');
+
+startRxBtn.onclick = async () => {
+    rxAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: FS });
+    await rxAudioCtx.resume();
     
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-        const mic = audioCtx.createMediaStreamSource(stream);
+        rxMediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+        const mic = rxAudioCtx.createMediaStreamSource(rxMediaStream);
         
-        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
-        const template = createPRNAudioBuffer(audioCtx).getChannelData(0);
+        rxProcessorNode = rxAudioCtx.createScriptProcessor(4096, 1, 1);
+        const template = createPRNAudioBuffer(rxAudioCtx).getChannelData(0);
         
-        mic.connect(processor);
-        processor.connect(audioCtx.destination);
+        mic.connect(rxProcessorNode);
+        rxProcessorNode.connect(rxAudioCtx.destination);
         
-        document.getElementById('rxPanel').style.display = 'block';
-        document.getElementById('sysStatus').className = 'status status-on';
-        document.getElementById('sysStatus').innerText = '接收端运行中 (麦克风实时监听)';
+        // 更新 UI 状态
+        startRxBtn.disabled = true;
+        stopRxBtn.disabled = false;
+        calibrateBtn.disabled = false;
+        document.getElementById('rxStatus').className = 'status status-on';
+        document.getElementById('rxStatus').innerText = '测量中';
 
         const canvas = document.getElementById('corrCanvas');
         const ctx2d = canvas.getContext('2d');
-        let latestPeakFine = 0;
 
-        processor.onaudioprocess = (e) => {
+        rxProcessorNode.onaudioprocess = (e) => {
             const input = e.inputBuffer.getChannelData(0);
             
+            // 计算信号能量均值
+            let avgEnergy = 0;
+            for(let i=0; i<input.length; i++) avgEnergy += Math.abs(input[i]);
+            avgEnergy /= input.length;
+
             // 互相关计算
             let maxCorr = 0;
             let peakIdx = 0;
@@ -183,53 +229,99 @@ document.getElementById('startRxBtn').onclick = async () => {
                 }
             }
 
-            // 抛物线亚采样插值
+            // 门限判断：若相关峰强度过低，视为噪点不更新
+            const snrThreshold = 0.05;
+            if (maxCorr < snrThreshold) {
+                document.getElementById('signalQuality').innerText = "信号强度: 弱 (请靠近或调大音量)";
+                document.getElementById('signalQuality').style.color = "#ef4444";
+                return;
+            } else {
+                document.getElementById('signalQuality').innerText = "信号强度: 良好";
+                document.getElementById('signalQuality').style.color = "#10b981";
+            }
+
+            // 抛物线亚采样点插值
             let finePeak = peakIdx;
             if (peakIdx > 0 && peakIdx < corrMap.length - 1) {
                 let y1 = corrMap[peakIdx - 1], y2 = corrMap[peakIdx], y3 = corrMap[peakIdx + 1];
                 let delta = (y1 - y3) / (2 * (y1 - 2 * y2 + y3));
                 if (!isNaN(delta)) finePeak += delta;
             }
-            latestPeakFine = finePeak;
 
-            // 若已标定，实时解算距离
+            // --- 防抖滤波核心算法 (中值滤波 + EMA) ---
+            peakHistory.push(finePeak);
+            if (peakHistory.length > FILTER_WINDOW_SIZE) peakHistory.shift();
+
+            // 1. 求窗口内的中值 (去除野值)
+            let sortedArr = [...peakHistory].sort((a, b) => a - b);
+            let medianPeak = sortedArr[Math.floor(sortedArr.length / 2)];
+
+            // 2. 指数平滑 (EMA)
+            if (smoothPeak === null) {
+                smoothPeak = medianPeak;
+            } else {
+                const alpha = 0.25; // 平滑系数
+                smoothPeak = alpha * medianPeak + (1 - alpha) * smoothPeak;
+            }
+
+            // --- 距离解算 ---
             const d0 = parseFloat(document.getElementById('d0Input').value) || 1.0;
             if (t0_samples !== null) {
-                const dt = (latestPeakFine - t0_samples) / FS;
+                const dt = (smoothPeak - t0_samples) / FS;
                 const d = d0 + soundSpeed * dt;
                 const deltaM = d - d0;
+                
                 document.getElementById('distDisplay').innerText = d.toFixed(3) + ' m';
                 document.getElementById('deltaDisplay').innerText = `相对位移 Δd: ${(deltaM >= 0 ? '+' : '') + (deltaM * 1000).toFixed(1)} mm`;
             }
 
-            // 绘制互相关曲线
+            // 绘制波形图
             ctx2d.clearRect(0, 0, canvas.width, canvas.height);
             ctx2d.strokeStyle = '#38bdf8';
-            ctx2d.lineWidth = 2;
+            ctx2d.lineWidth = 1.5;
             ctx2d.beginPath();
             for (let i = 0; i < corrMap.length; i += 4) {
                 let x = (i / corrMap.length) * canvas.width;
-                let y = canvas.height - (maxCorr > 0 ? (corrMap[i] / maxCorr) * (canvas.height - 10) : 0);
+                let y = canvas.height - (corrMap[i] / maxCorr) * (canvas.height - 10);
                 if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
             }
             ctx2d.stroke();
         };
 
-        // 绑定校准点击事件
-        document.getElementById('calibrateBtn').onclick = () => {
-            if (latestPeakFine === 0) {
-                alert("尚未检测到有效信号峰，请确保发射端正在播放且麦克风能收到声音！");
-                return;
-            }
-            t0_samples = latestPeakFine;
+        // 校准按钮绑定
+        calibrateBtn.onclick = () => {
+            if (smoothPeak === null) return;
+            t0_samples = smoothPeak;
             const currentd0 = document.getElementById('d0Input').value;
-            document.getElementById('calibStatus').innerHTML = `✅ <b style="color: #10b981;">已成功标定！</b> 初始距离 d0 = ${currentd0}m, 基准 t0 采样点 = ${t0_samples.toFixed(1)}`;
+            document.getElementById('calibStatus').innerHTML = `✅ <b style="color: #10b981;">标定成功！</b> d0=${currentd0}m, 锁定 t0=${t0_samples.toFixed(2)} pts`;
         };
 
     } catch (err) {
-        alert("无法获取麦克风权限！请确保使用 localhost 或 HTTPS 协议访问。");
+        alert("无法启动麦克风：请确保使用 HTTPS 或 localhost 打开，并授予麦克风权限。");
         console.error(err);
     }
+};
+
+// 停止测量按钮逻辑
+stopRxBtn.onclick = () => {
+    if (rxMediaStream) {
+        rxMediaStream.getTracks().forEach(track => track.stop());
+    }
+    if (rxAudioCtx) {
+        rxAudioCtx.close();
+    }
+    
+    // 重置状态
+    startRxBtn.disabled = false;
+    stopRxBtn.disabled = true;
+    calibrateBtn.disabled = true;
+    peakHistory = [];
+    smoothPeak = null;
+    
+    document.getElementById('rxStatus').className = 'status status-off';
+    document.getElementById('rxStatus').innerText = '已停止';
+    document.getElementById('signalQuality').innerText = "信号强度: --";
+    document.getElementById('signalQuality').style.color = "#94a3b8";
 };
 </script>
 </body>
