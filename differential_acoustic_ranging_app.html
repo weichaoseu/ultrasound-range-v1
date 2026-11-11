@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Differential Acoustic Ranging (DAR Lab)</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        darkBg: '#0b0f19',
+                        cardBg: '#111827',
+                        accentBlue: '#3b82f6',
+                        accentCyan: '#06b6d4',
+                        accentGreen: '#10b981',
+                        accentRed: '#ef4444'
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            background-color: #0b0f19;
+            color: #f3f4f6;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            user-select: none;
+        }
+        canvas {
+            image-rendering: pixelated;
+        }
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #111827;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #374151;
+            border-radius: 3px;
+        }
+        .glow-cyan {
+            box-shadow: 0 0 20px rgba(6, 182, 212, 0.25);
+        }
+        .glow-green {
+            box-shadow: 0 0 20px rgba(16, 185, 129, 0.25);
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between p-3 md:p-6 max-w-4xl mx-auto">
+
+    <!-- Header Section -->
+    <header class="flex justify-between items-center border-b border-gray-800 pb-4 mb-4">
+        <div class="flex items-center space-x-3">
+            <div class="p-2.5 bg-gradient-to-tr from-cyan-600 to-blue-600 rounded-xl shadow-lg">
+                <i class="fa-solid fa-wave-square text-2xl text-white"></i>
+            </div>
+            <div>
+                <h1 class="text-xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
+                    声学差分测距 (Acoustic DAR Lab)
+                </h1>
+                <p class="text-xs text-gray-400">Differential Acoustic Distance Measurement System</p>
+            </div>
+        </div>
+        
+        <!-- Environment Quick Display -->
+        <div class="px-3 py-1.5 bg-gray-900 text-xs text-cyan-400 rounded-lg flex items-center space-x-2 border border-gray-800 font-mono">
+            <i class="fa-solid fa-temperature-half text-cyan-400"></i>
+            <span id="speedDisplay">c = 343.3 m/s (20°C)</span>
+        </div>
+    </header>
+
+    <!-- Mode Selector Tabs -->
+    <div class="grid grid-cols-2 gap-2 p-1.5 bg-gray-900 rounded-xl mb-4 border border-gray-800">
+        <button id="tabTxBtn" class="py-2.5 rounded-lg text-sm font-semibold flex items-center justify-center space-x-2 transition-all text-gray-400 hover:text-white">
+            <i class="fa-solid fa-tower-broadcast"></i>
+            <span>手机A (发射端 Transmitter)</span>
+        </button>
+        <button id="tabRxBtn" class="py-2.5 rounded-lg text-sm font-semibold flex items-center justify-center space-x-2 transition-all bg-cyan-600 text-white shadow-md">
+            <i class="fa-solid fa-microphone-lines"></i>
+            <span>手机B (接收端 Receiver & Calibration)</span>
+        </button>
+    </div>
+
+    <!-- MAIN CONTENT AREA -->
+    <main class="flex-grow space-y-4">
+
+        <!-- ==================== TRANSMITTER MODE (PHONE A) ==================== -->
+        <section id="txSection" class="hidden space-y-4">
+            <div class="bg-gray-900 border border-gray-800 rounded-2xl p-5 shadow-xl space-y-5">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <h2 class="text-base font-semibold text-gray-200">手机A：伪随机码（PRN）信标发射</h2>
+                        <p class="text-xs text-gray-400">循环播放 63-bit Gold 伪随机码，高频载波调制</p>
+                    </div>
+                    <span id="txStatusBadge" class="px-2.5 py-1 text-xs rounded-full bg-gray-800 text-gray-400 border border-gray-700 flex items-center space-x-1.5">
+                        <span class="w-2 h-2 rounded-full bg-gray-500"></span>
+                        <span>未发射</span>
+                    </span>
+                </div>
+
+                <!-- Transmitter Oscilloscope Canvas -->
+                <div class="relative bg-black rounded-xl overflow-hidden border border-gray-800 h-36">
+                    <canvas id="txCanvas" class="w-full h-full"></canvas>
+                    <div class="absolute top-2 left-2 text-[10px] text-gray-500 font-mono">TX SIGNAL WAVEFORM</div>
+                </div>
+
+                <!-- Controls Form -->
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                    <div class="space-y-1">
+                        <label class="text-gray-400">载波频率 Carrier Freq (Hz)</label>
+                        <select id="txCarrierFreq" class="w-full bg-gray-800 border border-gray-700 rounded-lg p-2 text-gray-200 focus:outline-none focus:border-cyan-500">
+                            <option value="15000">15.0 kHz (清晰可听)</option>
+                            <option value="17000">17.0 kHz (近超声波)</option>
+                            <option value="18500" selected>18.5 kHz (静音超声波)</option>
+                            <option value="20000">20.0 kHz (高频超声波)</option>
+                        </select>
+                    </div>
+
+                    <div class="space-y-1">
+                        <label class="text-gray-400">重复周期 T (ms)</label>
+                        <input id="txPeriod" type="number" value="200" min="50" max="1000" step="10" 
+                            class="w-full bg-gray-800 border border-gray-700 rounded-lg p-2 text-gray-200 focus:outline-none focus:border-cyan-500">
+                    </div>
+
+                    <div class="space-y-1">
+                        <label class="text-gray-400">发射音量 Output Volume</label>
+                        <input id="txVolume" type="range" min="0" max="1" step="0.05" value="0.8" 
+                            class="w-full accent-cyan-500 mt-2">
+                    </div>
+                </div>
+
+                <!-- TX Play/Stop Button -->
+                <button id="txToggleBtn" class="w-full py-3.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-bold rounded-xl shadow-lg flex items-center justify-center space-x-2 transition transform active:scale-95">
+                    <i class="fa-solid fa-play text-lg"></i>
+                    <span id="txBtnText" class="text-sm">开始循环播放 PRN 信标</span>
+                </button>
+            </div>
+        </section>
+
+
+        <!-- ==================== RECEIVER MODE (PHONE B) ==================== -->
+        <section id="rxSection" class="space-y-4">
+            
+            <!-- PROMINENT STEP-BY-STEP CALIBRATION & MEASUREMENT MODULE -->
+            <div class="bg-gradient-to-b from-gray-900 to-gray-950 border border-cyan-500/30 rounded-2xl p-5 shadow-2xl space-y-5">
+                <div class="flex justify-between items-center border-b border-gray-800 pb-3">
+                    <div class="flex items-center space-x-2">
+                        <div class="p-2 bg-cyan-500/10 rounded-lg border border-cyan-500/30 text-cyan-400">
+                            <i class="fa-solid fa-sliders text-lg"></i>
+                        </div>
+                        <div>
+                            <h2 class="text-base font-bold text-gray-100">校准与测量控制台 (Calibration & Measurement)</h2>
+                            <p class="text-xs text-gray-400">严格按照差分测距三步法进行系统配置、基准校准与实测解算</p>
+                        </div>
+                    </div>
+                    <div id="calibBadge" class="px-3 py-1 text-xs rounded-full bg-yellow-500/10 text-yellow-400 border border-yellow-500/30 font-semibold flex items-center space-x-1.5">
+                        <i class="fa-solid fa-circle-exclamation"></i>
+                        <span>未校准 (Uncalibrated)</span>
+                    </div>
+                </div>
+
+                <!-- STEP 1: SYSTEM SETTINGS -->
+                <div class="space-y-2">
+                    <div class="flex items-center space-x-2 text-xs font-bold text-cyan-400 uppercase tracking-wider">
+                        <span class="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-[10px]">1</span>
+                        <span>Step 1: 环境与采样参数配置</span>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 bg-gray-900 p-3 rounded-xl border border-gray-800 text-xs">
+                        <div>
+                            <label class="text-gray-400 block mb-1">环境温度 Temp (°C)</label>
+                            <input id="envTempInput" type="number" value="20" min="-10" max="50" step="0.5" 
+                                class="w-full bg-gray-800 border border-gray-700 rounded-lg p-2 text-cyan-300 font-mono font-bold focus:outline-none focus:border-cyan-500">
+                        </div>
+                        <div>
+                            <label class="text-gray-400 block mb-1">实时计算声速 $c$ (m/s)</label>
+                            <input id="calcSpeedVal" type="text" readonly value="343.30" 
+                                class="w-full bg-gray-950 border border-gray-800 rounded-lg p-2 text-emerald-400 font-mono font-bold focus:outline-none">
+                        </div>
+                        <div>
+                            <label class="text-gray-400 block mb-1">音频采集状态</label>
+                            <button id="rxListenBtn" class="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition flex items-center justify-center space-x-1">
+                                <i class="fa-solid fa-microphone"></i>
+                                <span id="rxListenBtnText">开启麦克风录音</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 2: BASE DISTANCE CALIBRATION -->
+                <div class="space-y-2">
+                    <div class="flex items-center space-x-2 text-xs font-bold text-cyan-400 uppercase tracking-wider">
+                        <span class="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-[10px]">2</span>
+                        <span>Step 2: 基准距离校准 (记录基准时间 $t_0$)</span>
+                    </div>
+                    <div class="bg-gray-900 p-3.5 rounded-xl border border-gray-800 space-y-3">
+                        <div class="flex flex-col md:flex-row items-stretch md:items-center gap-3">
+                            <div class="flex-1 flex items-center space-x-2">
+                                <span class="text-xs text-gray-300 whitespace-nowrap">已知基准距离 $d_0$:</span>
+                                <input id="d0Input" type="number" value="0.50" min="0.01" max="20.0" step="0.01" 
+                                    class="w-28 bg-gray-800 border border-gray-700 text-cyan-300 font-mono text-center text-sm font-bold rounded-lg px-2 py-1.5 focus:outline-none focus:border-cyan-500">
+                                <span class="text-xs text-gray-400">米 (m) / 卷尺实测</span>
+                            </div>
+
+                            <div class="flex space-x-2">
+                                <!-- Executive Calibration Button -->
+                                <button id="rxCalibrateBtn" disabled class="flex-1 md:flex-none px-5 py-2.5 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold rounded-xl shadow-lg flex items-center justify-center space-x-2 transition disabled:opacity-40 disabled:cursor-not-allowed">
+                                    <i class="fa-solid fa-bullseye text-base"></i>
+                                    <span>执行校准 (锁定 $t_0$)</span>
+                                </button>
+
+                                <button id="rxResetCalBtn" class="px-3.5 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 font-semibold text-xs rounded-xl border border-gray-700 transition flex items-center justify-center space-x-1">
+                                    <i class="fa-solid fa-rotate-right"></i>
+                                    <span>重置</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="text-[11px] text-gray-400 bg-gray-950 p-2.5 rounded-lg border border-gray-800/80 flex items-center justify-between">
+                            <span id="calibInfoText"><i class="fa-solid fa-info-circle text-cyan-400 mr-1"></i> 请先将手机B固定在已知距离 $d_0$ 处，开启录音后点击“执行校准”。</span>
+                            <span id="t0Display" class="font-mono text-cyan-400 font-bold ml-2">基准 $t_0$: 未设定</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- STEP 3: REAL-TIME DISTANCE CALCULATION -->
+                <div class="space-y-2">
+                    <div class="flex items-center space-x-2 text-xs font-bold text-cyan-400 uppercase tracking-wider">
+                        <span class="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-[10px]">3</span>
+                        <span>Step 3: 实时距离解算结果 ($d = d_0 + c \cdot (t_1 - t_0)$)</span>
+                    </div>
+
+                    <!-- Large Distance Display Gauge Card -->
+                    <div class="bg-gray-950 rounded-xl p-4 border border-gray-800 grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+                        <!-- Primary Calculated Distance -->
+                        <div class="md:col-span-2 space-y-1">
+                            <span class="text-xs text-gray-400 uppercase tracking-wider block">解算绝对距离 Distance ($d$)</span>
+                            <div class="flex items-baseline space-x-2">
+                                <span id="rxDistVal" class="text-4xl md:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-emerald-400 font-mono">--</span>
+                                <span class="text-lg font-bold text-gray-400">cm</span>
+                                <span id="rxDistDiff" class="ml-4 text-sm font-mono font-bold text-gray-500">相对位移 $\Delta d$: -- cm</span>
+                            </div>
+                            <p class="text-[11px] text-gray-500">结合高精度抛物线亚采样点插值，精度达毫米级</p>
+                        </div>
+
+                        <!-- Secondary Parameters Breakdown -->
+                        <div class="bg-gray-900 p-3 rounded-lg border border-gray-800 space-y-2 text-xs font-mono">
+                            <div class="flex justify-between">
+                                <span class="text-gray-400">当前峰值位置 $t_1$:</span>
+                                <span id="rxT1Display" class="text-white font-bold">-- ms</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-400">时间延时差 $\Delta t$:</span>
+                                <span id="rxDeltaTDisplay" class="text-cyan-400 font-bold">-- ms</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-400">相关峰信噪比 SNR:</span>
+                                <span id="rxSnrVal" class="text-emerald-400 font-bold">-- dB</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <!-- Receiver Signal Processing Visualizers -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Oscilloscope Buffer -->
+                <div class="bg-gray-900 border border-gray-800 rounded-xl p-3 space-y-1">
+                    <div class="flex justify-between items-center text-[11px] text-gray-400">
+                        <span class="font-semibold"><i class="fa-solid fa-waveform text-cyan-400 mr-1"></i> 实时麦克风时域信号</span>
+                        <span id="rxFsDisplay" class="font-mono text-gray-500">Fs: -- kHz</span>
+                    </div>
+                    <div class="relative bg-black rounded-lg overflow-hidden border border-gray-800 h-40">
+                        <canvas id="rxAudioCanvas" class="w-full h-full"></canvas>
+                    </div>
+                </div>
+
+                <!-- Cross Correlation Energy Graph -->
+                <div class="bg-gray-900 border border-gray-800 rounded-xl p-3 space-y-1">
+                    <div class="flex justify-between items-center text-[11px] text-gray-400">
+                        <span class="font-semibold"><i class="fa-solid fa-chart-line text-emerald-400 mr-1"></i> 互相关能量峰值 ($R_{xy}$) & $t_0$ 标记</span>
+                        <span id="rxSubsampleText" class="font-mono text-gray-500">Sub-sample: --</span>
+                    </div>
+                    <div class="relative bg-black rounded-lg overflow-hidden border border-gray-800 h-40">
+                        <canvas id="rxCorrCanvas" class="w-full h-full"></canvas>
+                    </div>
+                </div>
+            </div>
+
+        </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="mt-6 border-t border-gray-800 pt-3 text-center text-[11px] text-gray-500">
+        声学差分测距系统 (Differential Acoustic Ranging) &bull; 移动端浏览器实验平台
+    </footer>
+
+    <!-- LOGIC & SIGNAL PROCESSING SCRIPT -->
+    <script>
+        // --- CONSTANTS & STATE ---
+        const M_SEQ_63 = [
+            1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1, 1, -1, -1, 1, 
+            1, -1, 1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1, 1, 1, 1, 
+            -1, 1, -1, -1, -1, -1, 1, 1, -1, 1, -1, -1, 1, 1, -1, -1, 
+            1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1
+        ];
+
+        let audioCtx = null;
+        let envTemp = 20.0;
+        let speedOfSound = 331.3 + 0.6 * envTemp;
+
+        // Transmitter State
+        let isTransmitting = false;
+        let txBufferNode = null;
+        let txGainNode = null;
+        let txAnimId = null;
+
+        // Receiver State
+        let isReceiving = false;
+        let micStream = null;
+        let micSourceNode = null;
+        let scriptProcessor = null;
+        let rxAnimId = null;
+
+        // Calibration State
+        let refT0 = null;       // Base peak index/lag in samples or ms
+        let refD0 = 0.50;       // Base distance in meters
+        let currentPeakLagMs = 0;
+        let currentSubSample = 0;
+        let lastSNR = 0;
+
+        // Visualizer Canvas References
+        const txCanvas = document.getElementById('txCanvas');
+        const txCtx = txCanvas.getContext('2d');
+        const rxAudioCanvas = document.getElementById('rxAudioCanvas');
+        const rxAudioCtx = rxAudioCanvas.getContext('2d');
+        const rxCorrCanvas = document.getElementById('rxCorrCanvas');
+        const rxCorrCtx = rxCorrCanvas.getContext('2d');
+
+        // Buffers for Receiver Visualization
+        let latestAudioFrame = new Float32Array(1024);
+        let latestCorrBuffer = new Float32Array(512);
+
+        // --- HELPER: Initialize Audio Context ---
+        function getAudioContext() {
+            if (!audioCtx) {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContext({ latencyHint: 'interactive' });
+            }
+            if (audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+            return audioCtx;
+        }
+
+        // --- HELPER: Generate PRN Audio Buffer ---
+        function generatePRNBuffer(ctx, carrierFreq, periodMs) {
+            const sampleRate = ctx.sampleRate;
+            const totalSamples = Math.floor(sampleRate * (periodMs / 1000));
+            const buffer = ctx.createBuffer(1, totalSamples, sampleRate);
+            const data = buffer.getChannelData(0);
+
+        // STATE & PARAMETERS
+        let refT0 = null;       // Base peak timestamp t0 in ms
+        let refD0 = 0.50;       // Base distance d0 in meters
+
+        // DOM elements update for explicit step-by-step calibration
+        const envTempInput = document.getElementById('envTempInput');
+        const calcSpeedVal = document.getElementById('calcSpeedVal');
+        const speedDisplay = document.getElementById('speedDisplay');
+        const calibBadge = document.getElementById('calibBadge');
+        const t0Display = document.getElementById('t0Display');
+        const rxT1Display = document.getElementById('rxT1Display');
+        const rxDeltaTDisplay = document.getElementById('rxDeltaTDisplay');
+        const rxSubsampleText = document.getElementById('rxSubsampleText');
+
+        // Environmental Temperature change listener
+        envTempInput.addEventListener('input', (e) => {
+            envTemp = parseFloat(e.target.value) || 20.0;
+            speedOfSound = 331.3 + 0.6 * envTemp;
+            calcSpeedVal.value = speedOfSound.toFixed(2);
+            speedDisplay.textContent = `c = ${speedOfSound.toFixed(1)} m/s (${envTemp}°C)`;
+        });
+
+        // --- TRANSMITTER CONTROLS ---
+        const tabTxBtn = document.getElementById('tabTxBtn');
+        // --- RECEIVER PROCESSING & CALIBRATION ---
+        const txSection = document.getElementById('txSection');
+        // Updated Real-Time Cross-Correlation Engine
+        function processCrossCorrelation(audioBuffer, templateSignal, sampleRate) {
+            const N = audioBuffer.length;
+            const M = templateSignal.length;
+            const corrLen = N - M;
+
+            if (corrLen <= 0) return;
+
+            let maxCorr = -1;
+            let peakIndex = 0;
+            let energySum = 0;
+
+            const corrBuffer = new Float32Array(corrLen);
+
+            // Time-domain cross correlation
+            for (let lag = 0; lag < corrLen; lag++) {
+                let sum = 0;
+                for (let j = 0; j < M; j += 2) { // Step 2 optimization
+                    sum += audioBuffer[lag + j] * templateSignal[j];
+                }
+                const energy = Math.abs(sum);
+                corrBuffer[lag] = energy;
+                energySum += energy;
+
+                if (energy > maxCorr) {
+                    maxCorr = energy;
+                    peakIndex = lag;
+                }
+            }
+
+            latestCorrBuffer = corrBuffer;
+
+            // Compute SNR / Prominence
+            const avgNoise = (energySum - maxCorr) / (corrLen - 1 || 1);
+            const snr = avgNoise > 0 ? 20 * Math.log10(maxCorr / avgNoise) : 0;
+            lastSNR = snr;
+
+            // Sub-sample Parabolic Interpolation
+            let subSamplePeak = peakIndex;
+            if (peakIndex > 0 && peakIndex < corrLen - 1) {
+                const alpha = corrBuffer[peakIndex - 1];
+                const beta = corrBuffer[peakIndex];
+                const gamma = corrBuffer[peakIndex + 1];
+                const delta = (gamma - alpha) / (2 * (2 * beta - alpha - gamma) || 1);
+                if (Math.abs(delta) < 1) {
+                    subSamplePeak += delta;
+                }
+            }
+
+            // Convert sample index to lag time t1 (ms)
+            const lagMs = (subSamplePeak / sampleRate) * 1000;
+            currentPeakLagMs = lagMs;
+            currentSubSample = subSamplePeak;
+
+            // UI Real-time Parameters Update
+            rxT1Display.textContent = `${lagMs.toFixed(3)} ms`;
+            rxSubsampleText.textContent = `Sub-sample: ${subSamplePeak.toFixed(2)}`;
+            document.getElementById('rxSnrVal').textContent = `${snr.toFixed(1)} dB`;
+
+            // Compute Differential Distance if Calibrated
+            if (refT0 !== null) {
+                const deltaMs = currentPeakLagMs - refT0;
+                rxDeltaTDisplay.textContent = `${deltaMs >= 0 ? '+' : ''}${deltaMs.toFixed(3)} ms`;
+
+                // Differential equation: d = d0 + c * (t1 - t0)
+                const deltaTimeSec = deltaMs / 1000.0;
+                const distMeters = refD0 + speedOfSound * deltaTimeSec;
+                const distCm = distMeters * 100;
+                const deltaDistCm = (distMeters - refD0) * 100;
+
+                document.getElementById('rxDistVal').textContent = `${distCm.toFixed(1)}`;
+                document.getElementById('rxDistDiff').textContent = `相对位移 Δd: ${deltaDistCm >= 0 ? '+' : ''}${deltaDistCm.toFixed(2)} cm`;
+            }
+        }
+
+        // --- STEP 2: EXECUTE CALIBRATION ---
+        rxCalibrateBtn.addEventListener('click', () => {
+            if (!isReceiving) return;
+
+            refD0 = parseFloat(document.getElementById('d0Input').value) || 0.50;
+            refT0 = currentPeakLagMs;
+
+            // Update UI Calibration Status
+            calibBadge.className = "px-3 py-1 text-xs rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 font-semibold flex items-center space-x-1.5";
+            calibBadge.innerHTML = `<i class="fa-solid fa-circle-check"></i><span>已校准 (Calibrated)</span>`;
+
+            t0Display.textContent = `基准 t0: ${refT0.toFixed(3)} ms`;
+            document.getElementById('calibInfoText').innerHTML = `<i class="fa-solid fa-check text-emerald-400 mr-1"></i> 校准成功！已锁定基准距离 d0=${refD0}m，基准时间 t0=${refT0.toFixed(3)}ms。现可自由移动手机进行测量。`;
+        });
+
+        rxResetCalBtn.addEventListener('click', () => {
+            refT0 = null;
+            calibBadge.className = "px-3 py-1 text-xs rounded-full bg-yellow-500/10 text-yellow-400 border border-yellow-500/30 font-semibold flex items-center space-x-1.5";
+            calibBadge.innerHTML = `<i class="fa-solid fa-circle-exclamation"></i><span>未校准 (Uncalibrated)</span>`;
+
+            t0Display.textContent = `基准 t0: 未设定`;
+            rxDeltaTDisplay.textContent = `-- ms`;
+            document.getElementById('rxDistVal').textContent = "--";
+            document.getElementById('rxDistDiff').textContent = "相对位移 Δd: -- cm";
+            document.getElementById('calibInfoText').innerHTML = `<i class="fa-solid fa-info-circle text-cyan-400 mr-1"></i> 请先将手机B固定在已知距离 d0 处，开启录音后点击“执行校准”。`;
+        });
+
+        // --- RENDER VISUALIZERS WITH T0 MARKER ---
+        function renderRxVisualizers() {
+            if (!isReceiving) return;
+
+            // 1. Audio Waveform Canvas
+            rxAudioCanvas.width = rxAudioCanvas.clientWidth * window.devicePixelRatio || 300;
+            rxAudioCanvas.height = rxAudioCanvas.clientHeight * window.devicePixelRatio || 150;
+            const aw = rxAudioCanvas.width;
+            const ah = rxAudioCanvas.height;
+
+            rxAudioCtx.fillStyle = '#000000';
+            rxAudioCtx.fillRect(0, 0, aw, ah);
+
+            rxAudioCtx.strokeStyle = '#06b6d4';
+            rxAudioCtx.lineWidth = 1.5;
+            rxAudioCtx.beginPath();
+            const aStep = Math.ceil(latestAudioFrame.length / aw);
+            for (let i = 0; i < aw; i++) {
+                const sample = latestAudioFrame[i * aStep] || 0;
+                const x = i;
+                const y = ah / 2 + sample * (ah / 2);
+                if (i === 0) rxAudioCtx.moveTo(x, y);
+                else rxAudioCtx.lineTo(x, y);
+            }
+            rxAudioCtx.stroke();
+
+            // 2. Correlation Energy Canvas with Reference Peak Indicator
+            rxCorrCanvas.width = rxCorrCanvas.clientWidth * window.devicePixelRatio || 300;
+            rxCorrCanvas.height = rxCorrCanvas.clientHeight * window.devicePixelRatio || 150;
+            const cw = rxCorrCanvas.width;
+            const ch = rxCorrCanvas.height;
+
+            rxCorrCtx.fillStyle = '#000000';
+            rxCorrCtx.fillRect(0, 0, cw, ch);
+
+            if (latestCorrBuffer.length > 0) {
+                let maxE = 0.001;
+                for (let i = 0; i < latestCorrBuffer.length; i++) {
+                    if (latestCorrBuffer[i] > maxE) maxE = latestCorrBuffer[i];
+                }
+
+                rxCorrCtx.strokeStyle = '#10b981';
+                rxCorrCtx.lineWidth = 2;
+                rxCorrCtx.beginPath();
+
+                const cStep = Math.ceil(latestCorrBuffer.length / cw);
+                for (let i = 0; i < cw; i++) {
+                    const energy = latestCorrBuffer[i * cStep] || 0;
+                    const x = i;
+                    const y = ch - (energy / maxE) * (ch - 10);
+                    if (i === 0) rxCorrCtx.moveTo(x, y);
+                    else rxCorrCtx.lineTo(x, y);
+                }
+                rxCorrCtx.stroke();
+
+                // Draw Reference Peak Line (t0) if Calibrated
+                if (refT0 !== null && audioCtx) {
+                    const refSampleIndex = (refT0 / 1000) * audioCtx.sampleRate;
+                    const refX = (refSampleIndex / latestCorrBuffer.length) * cw;
+
+                    if (refX >= 0 && refX <= cw) {
+                        rxCorrCtx.strokeStyle = '#3b82f6';
+                        rxCorrCtx.lineWidth = 2;
+                        rxCorrCtx.setLineDash([4, 4]);
+                        rxCorrCtx.beginPath();
+                        rxCorrCtx.moveTo(refX, 0);
+                        rxCorrCtx.lineTo(refX, ch);
+                        rxCorrCtx.stroke();
+                        rxCorrCtx.setLineDash([]);
+
+                        rxCorrCtx.fillStyle = '#3b82f6';
+                        rxCorrCtx.font = '10px monospace';
+                        rxCorrCtx.fillText('t0 Ref', refX + 3, 12);
+                    }
+                }
+            }
+
+            rxAnimId = requestAnimationFrame(renderRxVisualizers);
+        }
+
+        // --- ENVIRONMENT & TEMPERATURE SETTINGS ---
+        const envModal = document.getElementById('envModal');
+        const envModalBtn = document.getElementById('envModalBtn');
+        const closeEnvModal = document.getElementById('closeEnvModal');
+        const saveEnvBtn = document.getElementById('saveEnvBtn');
+        const envTempInput = document.getElementById('envTempInput');
+        const speedDisplay = document.getElementById('speedDisplay');
+        const modalSpeedCalc = document.getElementById('modalSpeedCalc');
+
+        envModalBtn.addEventListener('click', () => {
+            envModal.classList.remove('hidden');
+            envModal.classList.add('flex');
+        });
+
+        closeEnvModal.addEventListener('click', () => {
+            envModal.classList.add('hidden');
+            envModal.classList.remove('flex');
+        });
+
+        envTempInput.addEventListener('input', (e) => {
+            const temp = parseFloat(e.target.value) || 20;
+            const c = 331.3 + 0.6 * temp;
+            modalSpeedCalc.textContent = `${c.toFixed(2)} m/s`;
+        });
+
+        saveEnvBtn.addEventListener('click', () => {
+            envTemp = parseFloat(envTempInput.value) || 20;
+            speedOfSound = 331.3 + 0.6 * envTemp;
+            speedDisplay.textContent = `c: ${speedOfSound.toFixed(1)} m/s (${envTemp}°C)`;
+            envModal.classList.add('hidden');
+            envModal.classList.remove('flex');
+        });
+    </script>
+</body>
+</html>
