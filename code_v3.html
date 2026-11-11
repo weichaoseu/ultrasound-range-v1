@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>宽带Chirp差分测距</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; text-align: center; }
+  h2 { color: #4fc3f7; font-size: 1.25em; }
+  button { font-size: 1.05em; padding: 12px 22px; margin: 6px; border: none; border-radius: 10px; background: #4fc3f7; color: #000; font-weight: bold; }
+  button:disabled { background: #444; color: #888; }
+  button.stop { background: #ef5350; color: #fff; }
+  input[type="number"] { font-size: 1em; padding: 7px; width: 90px; text-align: center; border-radius: 8px; border: 1px solid #555; background: #222; color: #fff; }
+  .panel { display: none; margin-top: 14px; }
+  .status { margin: 10px 0; min-height: 1.4em; color: #aaa; }
+  .big { font-size: 2em; font-weight: bold; color: #81c784; margin: 10px 0; }
+  .hint { font-size: 0.82em; color: #888; line-height: 1.5; text-align: left; margin-top: 18px; }
+  .row { margin: 8px 0; }
+  .debug { font-size: 0.82em; color: #ffb74d; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<h2>📡 宽带 Chirp 差分测距</h2>
+<div id="modeSelect">
+  <button id="txBtn">发射端</button>
+  <button id="rxBtn">接收端</button>
+</div>
+
+<div id="txPanel" class="panel">
+  <p>循环发射扫频信号</p>
+  <div class="row">起始频率 (Hz): <input id="f0Input" type="number" value="2000"></div>
+  <div class="row">终止频率 (Hz): <input id="f1Input" type="number" value="8000"></div>
+  <div class="row">扫频时长 (ms): <input id="durInput" type="number" value="40"></div>
+  <div class="row">周期 (ms): <input id="perInput" type="number" value="60"></div>
+  <button id="stopTx" class="stop">停止发射</button>
+</div>
+
+<div id="rxPanel" class="panel">
+  <div id="rxStatus" class="status">正在启动麦克风…</div>
+  <p><strong>接收端参数必须与发射端完全一致</strong></p>
+  <div class="row">起始频率 (Hz): <input id="rf0Input" type="number" value="2000"></div>
+  <div class="row">终止频率 (Hz): <input id="rf1Input" type="number" value="8000"></div>
+  <div class="row">扫频时长 (ms): <input id="rdurInput" type="number" value="40"></div>
+  <div class="row">周期 (ms): <input id="rperInput" type="number" value="60"></div>
+  <div id="debugInfo" class="debug"></div>
+  <div class="row">校准距离 (cm): <input id="calDist" type="number" value="30"></div>
+  <button id="calBtn" disabled>记录校准点</button>
+  <p>累积距离变化: <span id="peakPos">--</span></p>
+  <button id="measureBtn" disabled>测量距离</button>
+  <div id="distResult" class="big">-- cm</div>
+  <button id="stopRx" class="stop">停止接收</button>
+</div>
+
+<div class="hint">
+  <strong>使用方法：</strong><br>
+  1. 两部手机都<strong>立起来正对</strong>，扬声器和麦克风朝向对方，避免平放桌面（平放时直达信号弱、反射强）。<br>
+  2. A 机点“发射端”，B 机点“接收端”，两边频率/时长/周期保持一致。<br>
+  3. B 机放在已知距离，等“累积距离变化”稳定后点“记录校准点”。<br>
+  4. 缓慢移动 B，观察累积值是否连续变化。靠近为负，远离为正。<br>
+  5. 到达待测位置后点“测量距离”。<br>
+  <strong>提示：</strong>如果累积值仍然不动，说明直达信号太弱、跟踪到了反射峰。拉近两部手机（10–20 cm），调高发射音量，确认 SNR 稳定在 3 以上再试。
+</div>
+
+<script>
+(function(){
+'use strict';
+
+const fs = 48000;
+const soundSpeed = 34300;      // cm/s
+const FFT_SIZE = 8192;
+const SLIDE = 4096;
+const THRESHOLD = 2.5;
+const DIRECT_RATIO = 0.35;     // 直达峰阈值 = 最大峰 × 该比例
+
+let audioCtx = null;
+let txSource = null;
+let micStream = null;
+let processor = null;
+
+let txF0 = 2000, txF1 = 8000, txDurMs = 40, txPerMs = 60;
+let rxF0 = 2000, rxF1 = 8000, rxDurMs = 40, rxPerMs = 60;
+
+let ring = new Float32Array(FFT_SIZE * 2);
+let ringWrite = 0;
+let ringTotal = 0;
+let lastProcessedTotal = 0;
+
+let tplRe = null, tplIm = null;
+
+// 校准基准
+let calRawGlobal = null;   // 校准时的全局峰位置
+let calRingTotal = null;   // 校准时的总样本数
+let calDistance = null;    // 校准点距离 cm
+let distanceChange = 0;    // cm，相对校准点的变化
+let peakReady = false;
+
+function generateChirp(f0, f1, durMs) {
+  const n = Math.floor(fs * durMs / 1000);
+  const x = new Float32Array(n);
+  const T = durMs / 1000;
+  const k = (f1 - f0) / T;
+  for (let i = 0; i < n; i++) {
+    const t = i / fs;
+    const phase = 2 * Math.PI * (f0 * t + 0.5 * k * t * t);
+    const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
+    x[i] = Math.sin(phase) * w;
+  }
+  return x;
+}
+
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let tr = re[i]; re[i] = re[j]; re[j] = tr;
+      let ti = im[i]; im[i] = im[j]; im[j] = ti;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cRe = 1, cIm = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const uRe = re[i+j], uIm = im[i+j];
+        const vRe = re[i+j+len/2]*cRe - im[i+j+len/2]*cIm;
+        const vIm = re[i+j+len/2]*cIm + im[i+j+len/2]*cRe;
+        re[i+j] = uRe+vRe; im[i+j] = uIm+vIm;
+        re[i+j+len/2] = uRe-vRe; im[i+j+len/2] = uIm-vIm;
+        const nr = cRe*wRe - cIm*wIm;
+        cIm = cRe*wIm + cIm*wRe; cRe = nr;
+      }
+    }
+  }
+}
+
+function ifft(re, im) {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < n; i++) { re[i] /= n; im[i] = -im[i] / n; }
+}
+
+function initTemplate(f0, f1, durMs) {
+  const chirp = generateChirp(f0, f1, durMs);
+  const re = new Float32Array(FFT_SIZE);
+  const im = new Float32Array(FFT_SIZE);
+  const len = Math.min(chirp.length, FFT_SIZE);
+  for (let i = 0; i < len; i++) re[i] = chirp[i];
+  fft(re, im);
+  tplRe = re;
+  tplIm = im;
+}
+
+async function ensureAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+  }
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+}
+
+async function startTx() {
+  await ensureAudio();
+  stopTx();
+
+  txF0 = parseFloat(document.getElementById('f0Input').value) || 2000;
+  txF1 = parseFloat(document.getElementById('f1Input').value) || 8000;
+  txDurMs = parseFloat(document.getElementById('durInput').value) || 40;
+  txPerMs = parseFloat(document.getElementById('perInput').value) || 60;
+
+  if (txF1 <= txF0) { alert('终止频率需大于起始频率'); return; }
+  if (txPerMs < txDurMs) { alert('周期需大于等于扫频时长'); return; }
+
+  const chirp = generateChirp(txF0, txF1, txDurMs);
+  const perSamples = Math.floor(fs * txPerMs / 1000);
+  const buf = audioCtx.createBuffer(1, perSamples, fs);
+  const data = buf.getChannelData(0);
+  const gain = 0.55;
+  for (let i = 0; i < chirp.length && i < perSamples; i++) {
+    data[i] = chirp[i] * gain;
+  }
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  src.connect(audioCtx.destination);
+  src.start();
+  txSource = src;
+}
+
+function stopTx() {
+  if (txSource) { try { txSource.stop(); } catch(e){} txSource = null; }
+}
+
+async function startRx() {
+  await ensureAudio();
+  stopRx();
+
+  rxF0 = parseFloat(document.getElementById('rf0Input').value) || 2000;
+  rxF1 = parseFloat(document.getElementById('rf1Input').value) || 8000;
+  rxDurMs = parseFloat(document.getElementById('rdurInput').value) || 40;
+  rxPerMs = parseFloat(document.getElementById('rperInput').value) || 60;
+
+  if (rxF1 <= rxF0) { alert('终止频率需大于起始频率'); return; }
+
+  initTemplate(rxF0, rxF1, rxDurMs);
+
+  ringWrite = 0; ringTotal = 0; lastProcessedTotal = 0;
+  calRawGlobal = null; calRingTotal = null; calDistance = null;
+  distanceChange = 0; peakReady = false;
+
+  document.getElementById('peakPos').textContent = '--';
+  document.getElementById('distResult').textContent = '-- cm';
+  document.getElementById('calBtn').disabled = true;
+  document.getElementById('measureBtn').disabled = true;
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+  } catch (err) {
+    document.getElementById('rxStatus').textContent = '麦克风权限失败: ' + err.message;
+    return;
+  }
+
+  const source = audioCtx.createMediaStreamSource(micStream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    e.outputBuffer.getChannelData(0).fill(0);
+    appendRing(input);
+    tryProcess();
+  };
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+
+  document.getElementById('rxStatus').textContent = '监听中…等待扫频信号';
+}
+
+function stopRx() {
+  if (processor) { try { processor.disconnect(); } catch(e){} processor = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+
+function appendRing(input) {
+  const cap = ring.length;
+  for (let i = 0; i < input.length; i++) {
+    ring[ringWrite] = input[i];
+    ringWrite = (ringWrite + 1) % cap;
+    ringTotal++;
+  }
+}
+
+function tryProcess() {
+  if (ringTotal - lastProcessedTotal < SLIDE) return;
+  if (ringTotal < FFT_SIZE) return;
+  if (!tplRe) return;
+
+  const win = new Float32Array(FFT_SIZE);
+  const start = ringTotal - FFT_SIZE;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    const idx = (ringWrite - FFT_SIZE + i + ring.length) % ring.length;
+    win[i] = ring[idx];
+  }
+
+  const re = new Float32Array(FFT_SIZE);
+  const im = new Float32Array(FFT_SIZE);
+  re.set(win);
+  fft(re, im);
+
+  const rRe = new Float32Array(FFT_SIZE);
+  const rIm = new Float32Array(FFT_SIZE);
+  for (let i = 0; i < FFT_SIZE; i++) {
+    rRe[i] = re[i]*tplRe[i] + im[i]*tplIm[i];
+    rIm[i] = im[i]*tplRe[i] - re[i]*tplIm[i];
+  }
+  ifft(rRe, rIm);
+
+  // 找最大峰（用于 SNR）
+  let maxVal = -Infinity, maxIdx = 0, sum = 0;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    const v = rRe[i];
+    sum += v * v;
+    if (v > maxVal) { maxVal = v; maxIdx = i; }
+  }
+  const rms = Math.sqrt(sum / FFT_SIZE);
+  const snr = rms > 1e-9 ? maxVal / rms : 0;
+
+  document.getElementById('debugInfo').textContent =
+    'SNR: ' + snr.toFixed(2) + ' (阈值 ' + THRESHOLD + ')';
+
+  if (snr < THRESHOLD) {
+    document.getElementById('rxStatus').textContent = '信号太弱，等待中…';
+    lastProcessedTotal = ringTotal - SLIDE;
+    return;
+  }
+
+  // 找第一个显著峰（直达路径），而不是最大峰
+  let peakIdx = maxIdx;
+  const directThreshold = maxVal * DIRECT_RATIO;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    if (rRe[i] > directThreshold) {
+      const prev = rRe[(i - 1 + FFT_SIZE) % FFT_SIZE];
+      const next = rRe[(i + 1) % FFT_SIZE];
+      if (rRe[i] >= prev && rRe[i] >= next) {
+        peakIdx = i;
+        break;
+      }
+    }
+  }
+
+  // 抛物线插值
+  const y0 = rRe[(peakIdx - 1 + FFT_SIZE) % FFT_SIZE];
+  const y1 = rRe[peakIdx];
+  const y2 = rRe[(peakIdx + 1) % FFT_SIZE];
+  const denom = y0 - 2*y1 + y2;
+  const delta = denom !== 0 ? 0.5 * (y0 - y2) / denom : 0;
+  const refined = peakIdx + delta;
+
+  const rawGlobal = start + refined;
+
+  document.getElementById('rxStatus').textContent = '✅ 已锁定信号';
+  if (!peakReady) {
+    peakReady = true;
+    document.getElementById('calBtn').disabled = false;
+  }
+
+  // 基于校准点的直接差分
+  if (calRawGlobal !== null && calRingTotal !== null) {
+    const deltaTime = ringTotal - calRingTotal;
+    const deltaPeak = rawGlobal - calRawGlobal;
+    let delayChange = deltaPeak - deltaTime;
+
+    const periodSamples = fs * rxPerMs / 1000;
+    delayChange = ((delayChange % periodSamples) + periodSamples) % periodSamples;
+    if (delayChange > periodSamples / 2) delayChange -= periodSamples;
+
+    distanceChange = delayChange * soundSpeed / fs;
+    document.getElementById('peakPos').textContent =
+      (distanceChange >= 0 ? '+' : '') + distanceChange.toFixed(1) + ' cm';
+  }
+
+  lastProcessedTotal = ringTotal - SLIDE;
+}
+
+function doCalibrate() {
+  if (!peakReady) return;
+  calDistance = parseFloat(document.getElementById('calDist').value) || 30;
+
+  // 用当前帧的 rawGlobal 和 ringTotal 作为基准
+  // 重新计算一次当前峰位置
+  if (ringTotal < FFT_SIZE) return;
+  const win = new Float32Array(FFT_SIZE);
+  const start = ringTotal - FFT_SIZE;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    const idx = (ringWrite - FFT_SIZE + i + ring.length) % ring.length;
+    win[i] = ring[idx];
+  }
+  const re = new Float32Array(FFT_SIZE);
+  const im = new Float32Array(FFT_SIZE);
+  re.set(win);
+  fft(re, im);
+  const rRe = new Float32Array(FFT_SIZE);
+  const rIm = new Float32Array(FFT_SIZE);
+  for (let i = 0; i < FFT_SIZE; i++) {
+    rRe[i] = re[i]*tplRe[i] + im[i]*tplIm[i];
+    rIm[i] = im[i]*tplRe[i] - re[i]*tplIm[i];
+  }
+  ifft(rRe, rIm);
+  let maxVal = -Infinity, maxIdx = 0;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    if (rRe[i] > maxVal) { maxVal = rRe[i]; maxIdx = i; }
+  }
+  let peakIdx = maxIdx;
+  const directThreshold = maxVal * DIRECT_RATIO;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    if (rRe[i] > directThreshold) {
+      const prev = rRe[(i - 1 + FFT_SIZE) % FFT_SIZE];
+      const next = rRe[(i + 1) % FFT_SIZE];
+      if (rRe[i] >= prev && rRe[i] >= next) { peakIdx = i; break; }
+    }
+  }
+  const y0 = rRe[(peakIdx - 1 + FFT_SIZE) % FFT_SIZE];
+  const y1 = rRe[peakIdx];
+  const y2 = rRe[(peakIdx + 1) % FFT_SIZE];
+  const denom = y0 - 2*y1 + y2;
+  const delta = denom !== 0 ? 0.5 * (y0 - y2) / denom : 0;
+
+  calRawGlobal = start + peakIdx + delta;
+  calRingTotal = ringTotal;
+  distanceChange = 0;
+
+  document.getElementById('peakPos').textContent = '+0.0 cm';
+  document.getElementById('measureBtn').disabled = false;
+  document.getElementById('distResult').textContent = '已校准 @ ' + calDistance + ' cm';
+}
+
+function doMeasure() {
+  if (calDistance === null) return;
+  const dist = calDistance + distanceChange;
+  document.getElementById('distResult').textContent = dist.toFixed(1) + ' cm';
+}
+
+document.getElementById('txBtn').onclick = async () => {
+  document.getElementById('modeSelect').style.display = 'none';
+  document.getElementById('txPanel').style.display = 'block';
+  document.getElementById('rxPanel').style.display = 'none';
+  await startTx();
+};
+
+document.getElementById('rxBtn').onclick = async () => {
+  document.getElementById('modeSelect').style.display = 'none';
+  document.getElementById('txPanel').style.display = 'none';
+  document.getElementById('rxPanel').style.display = 'block';
+  await startRx();
+};
+
+document.getElementById('stopTx').onclick = () => {
+  stopTx();
+  document.getElementById('modeSelect').style.display = 'block';
+  document.getElementById('txPanel').style.display = 'none';
+};
+
+document.getElementById('stopRx').onclick = () => {
+  stopRx();
+  document.getElementById('modeSelect').style.display = 'block';
+  document.getElementById('rxPanel').style.display = 'none';
+};
+
+document.getElementById('calBtn').onclick = doCalibrate;
+document.getElementById('measureBtn').onclick = doMeasure;
+
+})();
+</script>
+</body>
+</html>
