@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>宽带Chirp差分测距</title>
+<style>
+  body { font-family: -apple-system, sans-serif; margin: 0; padding: 16px; background: #111; color: #eee; text-align: center; }
+  h2 { color: #4fc3f7; font-size: 1.25em; }
+  button { font-size: 1.05em; padding: 12px 22px; margin: 6px; border: none; border-radius: 10px; background: #4fc3f7; color: #000; font-weight: bold; }
+  button:disabled { background: #444; color: #888; }
+  button.stop { background: #ef5350; color: #fff; }
+  input[type="number"] { font-size: 1em; padding: 7px; width: 90px; text-align: center; border-radius: 8px; border: 1px solid #555; background: #222; color: #fff; }
+  .panel { display: none; margin-top: 14px; }
+  .status { margin: 10px 0; min-height: 1.4em; color: #aaa; }
+  .big { font-size: 2em; font-weight: bold; color: #81c784; margin: 10px 0; }
+  .hint { font-size: 0.82em; color: #888; line-height: 1.5; text-align: left; margin-top: 18px; }
+  .row { margin: 8px 0; }
+</style>
+</head>
+<body>
+<h2>📡 宽带 Chirp 差分测距</h2>
+<div id="modeSelect">
+  <button id="txBtn">发射端</button>
+  <button id="rxBtn">接收端</button>
+</div>
+
+<div id="txPanel" class="panel">
+  <p>循环发射 1–20 kHz 扫频</p>
+  <div class="row">起始频率 (Hz): <input id="f0Input" type="number" value="1000"></div>
+  <div class="row">终止频率 (Hz): <input id="f1Input" type="number" value="20000"></div>
+  <div class="row">扫频时长 (ms): <input id="durInput" type="number" value="40"></div>
+  <div class="row">周期 (ms): <input id="perInput" type="number" value="60"></div>
+  <button id="stopTx" class="stop">停止发射</button>
+</div>
+
+<div id="rxPanel" class="panel">
+  <div id="rxStatus" class="status">正在启动麦克风…</div>
+  <div class="row">校准距离 (cm): <input id="calDist" type="number" value="30"></div>
+  <button id="calBtn" disabled>记录校准点</button>
+  <p>峰值位置: <span id="peakPos">--</span></p>
+  <button id="measureBtn" disabled>测量距离</button>
+  <div id="distResult" class="big">-- cm</div>
+  <button id="stopRx" class="stop">停止接收</button>
+</div>
+
+<div class="hint">
+  <strong>使用方法：</strong><br>
+  1. A 机点“发射端”循环发声；B 机点“接收端”并允许麦克风。<br>
+  2. B 放在已知距离（如 30 cm），等峰值稳定后点“记录校准点”。<br>
+  3. B 移动到待测位置，点“测量距离”。<br>
+  <strong>宽带优势：</strong>扫频 1–20 kHz 的理论距离分辨率约 0.9 cm（受硬件频响影响，实际可能 2–5 cm）。<br>
+  <strong>注意：</strong>手机扬声器在 1 kHz 以下和 16 kHz 以上衰减很大，若信号弱可把起始/终止频率改为 2000–16000 再试。保持 B 持续录音不要停，先近后远缓慢移动。
+</div>
+
+<script>
+(function(){
+'use strict';
+
+// ==================== 参数 ====================
+const fs = 48000;
+const soundSpeed = 34300;      // cm/s
+const FFT_SIZE = 8192;
+const SLIDE = 4096;            // 每次滑动样本数
+
+let audioCtx = null;
+let txSource = null;
+let micStream = null;
+let processor = null;
+
+// 发射参数
+let txF0 = 1000, txF1 = 20000, txDurMs = 40, txPerMs = 60;
+
+// 接收端环形缓冲
+let ring = new Float32Array(FFT_SIZE * 2);
+let ringWrite = 0;
+let ringTotal = 0;             // 已写入的总样本数
+let lastProcessedTotal = 0;
+
+// 模板
+let tplRe, tplIm;              // 模板频谱
+let tplLen = 0;                // chirp 实际样本数
+
+// 峰跟踪
+let lastRawGlobal = null;
+let unwrapOffset = 0;
+let currentUnwrapped = null;
+let calPeak = null;
+let calDistance = 30;
+let peakReady = false;
+
+// ==================== Chirp 生成 ====================
+function generateChirp(f0, f1, durMs, fs) {
+  const n = Math.floor(fs * durMs / 1000);
+  const x = new Float32Array(n);
+  const T = durMs / 1000;
+  const k = (f1 - f0) / T;
+  for (let i = 0; i < n; i++) {
+    const t = i / fs;
+    const phase = 2 * Math.PI * (f0 * t + 0.5 * k * t * t);
+    // Hann 窗减少频谱泄漏
+    const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
+    x[i] = Math.sin(phase) * w;
+  }
+  return x;
+}
+
+// ==================== FFT ====================
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cRe = 1, cIm = 0;
+      for (let j = 0; j < len / 2; j++) {
+        const uRe = re[i+j], uIm = im[i+j];
+        const vRe = re[i+j+len/2]*cRe - im[i+j+len/2]*cIm;
+        const vIm = re[i+j+len/2]*cIm + im[i+j+len/2]*cRe;
+        re[i+j] = uRe+vRe; im[i+j] = uIm+vIm;
+        re[i+j+len/2] = uRe-vRe; im[i+j+len/2] = uIm-vIm;
+        const nr = cRe*wRe - cIm*wIm;
+        cIm = cRe*wIm + cIm*wRe; cRe = nr;
+      }
+    }
+  }
+}
+function ifft(re, im) {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < n; i++) { re[i] /= n; im[i] = -im[i] / n; }
+}
+
+// ==================== 初始化 ====================
+function initTemplate() {
+  const chirp = generateChirp(txF0, txF1, txDurMs, fs);
+  tplLen = chirp.length;
+  const re = new Float32Array(FFT_SIZE);
+  const im = new Float32Array(FFT_SIZE);
+  for (let i = 0; i < tplLen; i++) re[i] = chirp[i];
+  fft(re, im);
+  tplRe = re; tplIm = im;
+}
+
+async function ensureAudio() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+  }
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+}
+
+// ==================== 发射端 ====================
+async function startTx() {
+  await ensureAudio();
+  stopTx();
+  txF0 = parseFloat(document.getElementById('f0Input').value) || 1000;
+  txF1 = parseFloat(document.getElementById('f1Input').value) || 20000;
+  txDurMs = parseFloat(document.getElementById('durInput').value) || 40;
+  txPerMs = parseFloat(document.getElementById('perInput').value) || 60;
+  if (txF1 <= txF0) { alert('终止频率需大于起始频率'); return; }
+  if (txPerMs < txDurMs) { alert('周期需大于等于扫频时长'); return; }
+
+  initTemplate();
+
+  const chirp = generateChirp(txF0, txF1, txDurMs, fs);
+  const perSamples = Math.floor(fs * txPerMs / 1000);
+  const buf = audioCtx.createBuffer(1, perSamples, fs);
+  const data = buf.getChannelData(0);
+  const gain = 0.55;
+  for (let i = 0; i < chirp.length && i < perSamples; i++) data[i] = chirp[i] * gain;
+  // 剩余部分保持 0（静音间隙）
+
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  src.connect(audioCtx.destination);
+  src.start();
+  txSource = src;
+}
+function stopTx() {
+  if (txSource) { try { txSource.stop(); } catch(e){} txSource = null; }
+}
+
+// ==================== 接收端 ====================
+async function startRx() {
+  await ensureAudio();
+  stopRx();
+  ringWrite = 0; ringTotal = 0; lastProcessedTotal = 0;
+  lastRawGlobal = null; unwrapOffset = 0; currentUnwrapped = null;
+  calPeak = null; peakReady = false;
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+  } catch (err) {
+    document.getElementById('rxStatus').textContent = '麦克风权限失败: ' + err.message;
+    return;
+  }
+  const source = audioCtx.createMediaStreamSource(micStream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    e.outputBuffer.getChannelData(0).fill(0);
+    appendRing(input);
+    tryProcess();
+  };
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+  document.getElementById('rxStatus').textContent = '监听中…等待扫频信号';
+}
+
+function stopRx() {
+  if (processor) { try { processor.disconnect(); } catch(e){} processor = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+
+function appendRing(input) {
+  const cap = ring.length;
+  for (let i = 0; i < input.length; i++) {
+    ring[ringWrite] = input[i];
+    ringWrite = (ringWrite + 1) % cap;
+    ringTotal++;
+  }
+}
+
+// ==================== 匹配滤波 ====================
+function tryProcess() {
+  if (ringTotal - lastProcessedTotal < SLIDE) return;
+  if (ringTotal < FFT_SIZE) return;
+
+  // 取最近 FFT_SIZE 个样本（按时间顺序）
+  const win = new Float32Array(FFT_SIZE);
+  const start = ringTotal - FFT_SIZE;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    const idx = (ringWrite - FFT_SIZE + i + ring.length) % ring.length;
+    win[i] = ring[idx];
+  }
+
+  const re = new Float32Array(FFT_SIZE);
+  const im = new Float32Array(FFT_SIZE);
+  re.set(win);
+  fft(re, im);
+
+  // R = IFFT(FFT(win) * conj(FFT(tpl)))
+  const rRe = new Float32Array(FFT_SIZE);
+  const rIm = new Float32Array(FFT_SIZE);
+  for (let i = 0; i < FFT_SIZE; i++) {
+    rRe[i] = re[i]*tplRe[i] + im[i]*tplIm[i];
+    rIm[i] = im[i]*tplRe[i] - re[i]*tplIm[i];
+  }
+  ifft(rRe, rIm);
+
+  // 找最大峰（实部）
+  let maxVal = -Infinity, maxIdx = 0, sum = 0;
+  for (let i = 0; i < FFT_SIZE; i++) {
+    const v = rRe[i];
+    sum += v * v;
+    if (v > maxVal) { maxVal = v; maxIdx = i; }
+  }
+  const rms = Math.sqrt(sum / FFT_SIZE);
+  if (maxVal < rms * 6) {
+    document.getElementById('rxStatus').textContent = '信号太弱，等待中…';
+    lastProcessedTotal = ringTotal - SLIDE;
+    return;
+  }
+
+  // 抛物线插值
+  const y0 = rRe[(maxIdx - 1 + FFT_SIZE) % FFT_SIZE];
+  const y1 = rRe[maxIdx];
+  const y2 = rRe[(maxIdx + 1) % FFT_SIZE];
+  const denom = y0 - 2*y1 + y2;
+  const delta = denom !== 0 ? 0.5 * (y0 - y2) / denom : 0;
+  const refined = maxIdx + delta;
+
+  // 全局峰位置（样本）
+  const rawGlobal = start + refined;
+
+  // 解卷绕：处理 chirp 周期跳变
+  const periodSamples = fs * txPerMs / 1000;
+  if (lastRawGlobal !== null) {
+    let diff = rawGlobal - lastRawGlobal;
+    if (diff < -periodSamples/2) unwrapOffset += periodSamples;
+    else if (diff > periodSamples/2) unwrapOffset -= periodSamples;
+  }
+  lastRawGlobal = rawGlobal;
+  currentUnwrapped = rawGlobal + unwrapOffset;
+
+  document.getElementById('rxStatus').textContent = '✅ 已锁定信号';
+  document.getElementById('peakPos').textContent = currentUnwrapped.toFixed(2);
+  if (!peakReady) {
+    peakReady = true;
+    document.getElementById('calBtn').disabled = false;
+  }
+
+  lastProcessedTotal = ringTotal - SLIDE;
+}
+
+// ==================== 校准与测量 ====================
+function doCalibrate() {
+  if (currentUnwrapped === null) return;
+  calDistance = parseFloat(document.getElementById('calDist').value) || 30;
+  calPeak = currentUnwrapped;
+  document.getElementById('measureBtn').disabled = false;
+  document.getElementById('distResult').textContent = '已校准 @ ' + calDistance + ' cm';
+}
+function doMeasure() {
+  if (calPeak === null || currentUnwrapped === null) return;
+  const dist = calDistance + soundSpeed * (currentUnwrapped - calPeak) / fs;
+  document.getElementById('distResult').textContent = dist.toFixed(1) + ' cm';
+}
+
+// ==================== 事件绑定 ====================
+document.getElementById('txBtn').onclick = async () => {
+  document.getElementById('modeSelect').style.display = 'none';
+  document.getElementById('txPanel').style.display = 'block';
+  document.getElementById('rxPanel').style.display = 'none';
+  await startTx();
+};
+document.getElementById('rxBtn').onclick = async () => {
+  document.getElementById('modeSelect').style.display = 'none';
+  document.getElementById('txPanel').style.display = 'none';
+  document.getElementById('rxPanel').style.display = 'block';
+  await startRx();
+};
+document.getElementById('stopTx').onclick = () => {
+  stopTx();
+  document.getElementById('modeSelect').style.display = 'block';
+  document.getElementById('txPanel').style.display = 'none';
+};
+document.getElementById('stopRx').onclick = () => {
+  stopRx();
+  document.getElementById('modeSelect').style.display = 'block';
+  document.getElementById('rxPanel').style.display = 'none';
+};
+document.getElementById('calBtn').onclick = doCalibrate;
+document.getElementById('measureBtn').onclick = doMeasure;
+
+})();
+</script>
+</body>
+</html>
