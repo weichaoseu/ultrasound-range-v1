@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>声学差分测距仪 (Differential Acoustic Ranging)</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 15px; background: #0f172a; color: #f8fafc; }
+        .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 15px; border: 1px solid #334155; }
+        h2 { margin-top: 0; font-size: 1.1rem; color: #38bdf8; border-bottom: 1px solid #334155; padding-bottom: 8px; }
+        .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; margin-top: 8px; }
+        .btn-primary { background: #0284c7; color: white; }
+        .btn-success { background: #16a34a; color: white; }
+        .btn-warning { background: #d97706; color: white; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        input { width: 100%; padding: 10px; background: #0f172a; border: 1px solid #475569; color: white; border-radius: 6px; box-sizing: border-box; font-size: 1rem; }
+        label { display: block; margin-bottom: 4px; }
+        .metric-title { font-size: 0.85rem; color: #94a3b8; }
+        .metric-value { font-size: 2.2rem; font-weight: bold; color: #38bdf8; margin: 5px 0; }
+        canvas { width: 100%; height: 130px; background: #090d16; border-radius: 6px; margin-top: 10px; }
+        .status { padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; display: inline-block; }
+        .status-off { background: #475569; }
+        .status-on { background: #16a34a; }
+        .step-box { background: #0f172a; padding: 12px; border-radius: 8px; border: 1px dashed #475569; margin-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>模式选择 & 启动</h2>
+        <div class="grid">
+            <button class="btn btn-primary" id="startTxBtn">发射端 (播放PRN)</button>
+            <button class="btn btn-primary" id="startRxBtn">接收端 (麦克风测距)</button>
+        </div>
+        <div style="margin-top: 10px;">
+            运行状态: <span id="sysStatus" class="status status-off">未初始化</span>
+        </div>
+    </div>
+
+    <!-- 接收端控制与校准面板 -->
+    <div class="card" id="rxPanel" style="display: none;">
+        <h2>差分测距与校准控制台</h2>
+        
+        <div class="grid" style="margin-bottom: 12px;">
+            <div>
+                <label class="metric-title">环境温度 (°C)</label>
+                <input type="number" id="tempInput" value="25" step="1">
+            </div>
+            <div>
+                <label class="metric-title">当前声速 c (m/s)</label>
+                <input type="text" id="soundSpeedDisplay" value="346.3" readonly style="color: #38bdf8; background: #111827;">
+            </div>
+        </div>
+
+        <!-- 步骤一：校准距离设置 -->
+        <div class="step-box">
+            <label style="font-weight: bold; color: #38bdf8;">步骤 1：已知校准距离设定 (d0)</label>
+            <div class="metric-title" style="margin-bottom: 6px;">用卷尺量好手机A到B的初始距离，填入下方：</div>
+            <div style="display: flex; gap: 10px; align-items: center;">
+                <input type="number" id="d0Input" value="1.000" step="0.001" style="flex: 2;">
+                <span style="flex: 1; font-weight: bold;">米 (m)</span>
+            </div>
+            <button class="btn btn-success" id="calibrateBtn" style="margin-top: 10px;">🔒 锁定当前位置为基准 (记录 t0)</button>
+            <div id="calibStatus" style="font-size: 0.85rem; color: #f59e0b; margin-top: 6px;">状态：尚未标定 (请先放置于已知距离并点击锁定)</div>
+        </div>
+
+        <!-- 步骤二：实时测量结果 -->
+        <div class="step-box" style="margin-top: 15px; text-align: center; border-style: solid; border-color: #334155;">
+            <div class="metric-title">步骤 2：待测距离实时解算 (d)</div>
+            <div class="metric-value" id="distDisplay">--.--- m</div>
+            <div id="deltaDisplay" style="font-size: 0.95rem; color: #10b981;">相对位移 Δd: -- mm</div>
+        </div>
+
+        <div style="margin-top: 15px;">
+            <span class="metric-title">互相关能量峰与延迟监控:</span>
+            <canvas id="corrCanvas"></canvas>
+        </div>
+    </div>
+
+<script>
+const FS = 48000;          // 采样率
+const CARRIER_FREQ = 18000;// 载波频率 18kHz
+const CHIP_RATE = 2000;    // 码元速率 2000 chips/s
+const PRN_LEN = 63;        // 6阶m序列长度 63
+let audioCtx = null;
+let t0_samples = null;     // 校准时的基准延迟点数 ($t_0$)
+let soundSpeed = 346.3;
+
+// 生成 m 序列
+function generateMSequence() {
+    let reg = 0x3F;
+    let seq = [];
+    for (let i = 0; i < PRN_LEN; i++) {
+        let feedback = ((reg >> 5) ^ (reg >> 4)) & 1;
+        seq.push((reg & 1) ? 1 : -1);
+        reg = ((reg << 1) | feedback) & 0x3F;
+    }
+    return seq;
+}
+
+// 调制 PRN 为 BPSK 音频 Buffer
+function createPRNAudioBuffer(ctx) {
+    const mSeq = generateMSequence();
+    const samplesPerChip = Math.floor(FS / CHIP_RATE);
+    const totalSamples = mSeq.length * samplesPerChip;
+    const buffer = ctx.createBuffer(1, totalSamples, FS);
+    const data = buffer.getChannelData(0);
+
+    for (let i = 0; i < totalSamples; i++) {
+        const chipIdx = Math.floor(i / samplesPerChip);
+        const t = i / FS;
+        data[i] = mSeq[chipIdx] * Math.sin(2 * Math.PI * CARRIER_FREQ * t);
+    }
+    return buffer;
+}
+
+// 实时更新声速
+function updateSoundSpeed() {
+    const temp = parseFloat(document.getElementById('tempInput').value) || 25;
+    soundSpeed = 331.3 + 0.6 * temp;
+    document.getElementById('soundSpeedDisplay').value = soundSpeed.toFixed(1) + ' m/s';
+}
+document.getElementById('tempInput').oninput = updateSoundSpeed;
+updateSoundSpeed();
+
+// ---------------- 发射端逻辑 ----------------
+document.getElementById('startTxBtn').onclick = async () => {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: FS });
+    await audioCtx.resume();
+    const buffer = createPRNAudioBuffer(audioCtx);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.loop = true;
+    src.connect(audioCtx.destination);
+    src.start();
+    document.getElementById('sysStatus').className = 'status status-on';
+    document.getElementById('sysStatus').innerText = '发射端运行中 (循环播放 18kHz PRN)';
+};
+
+// ---------------- 接收端逻辑 ----------------
+document.getElementById('startRxBtn').onclick = async () => {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: FS });
+    await audioCtx.resume();
+    
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+        const mic = audioCtx.createMediaStreamSource(stream);
+        
+        const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        const template = createPRNAudioBuffer(audioCtx).getChannelData(0);
+        
+        mic.connect(processor);
+        processor.connect(audioCtx.destination);
+        
+        document.getElementById('rxPanel').style.display = 'block';
+        document.getElementById('sysStatus').className = 'status status-on';
+        document.getElementById('sysStatus').innerText = '接收端运行中 (麦克风实时监听)';
+
+        const canvas = document.getElementById('corrCanvas');
+        const ctx2d = canvas.getContext('2d');
+        let latestPeakFine = 0;
+
+        processor.onaudioprocess = (e) => {
+            const input = e.inputBuffer.getChannelData(0);
+            
+            // 互相关计算
+            let maxCorr = 0;
+            let peakIdx = 0;
+            const N = input.length;
+            const M = template.length;
+            let corrMap = new Float32Array(N - M);
+
+            for (let i = 0; i < N - M; i += 2) {
+                let sum = 0;
+                for (let j = 0; j < M; j += 2) {
+                    sum += input[i + j] * template[j];
+                }
+                corrMap[i] = sum;
+                if (sum > maxCorr) {
+                    maxCorr = sum;
+                    peakIdx = i;
+                }
+            }
+
+            // 抛物线亚采样插值
+            let finePeak = peakIdx;
+            if (peakIdx > 0 && peakIdx < corrMap.length - 1) {
+                let y1 = corrMap[peakIdx - 1], y2 = corrMap[peakIdx], y3 = corrMap[peakIdx + 1];
+                let delta = (y1 - y3) / (2 * (y1 - 2 * y2 + y3));
+                if (!isNaN(delta)) finePeak += delta;
+            }
+            latestPeakFine = finePeak;
+
+            // 若已标定，实时解算距离
+            const d0 = parseFloat(document.getElementById('d0Input').value) || 1.0;
+            if (t0_samples !== null) {
+                const dt = (latestPeakFine - t0_samples) / FS;
+                const d = d0 + soundSpeed * dt;
+                const deltaM = d - d0;
+                document.getElementById('distDisplay').innerText = d.toFixed(3) + ' m';
+                document.getElementById('deltaDisplay').innerText = `相对位移 Δd: ${(deltaM >= 0 ? '+' : '') + (deltaM * 1000).toFixed(1)} mm`;
+            }
+
+            // 绘制互相关曲线
+            ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+            ctx2d.strokeStyle = '#38bdf8';
+            ctx2d.lineWidth = 2;
+            ctx2d.beginPath();
+            for (let i = 0; i < corrMap.length; i += 4) {
+                let x = (i / corrMap.length) * canvas.width;
+                let y = canvas.height - (maxCorr > 0 ? (corrMap[i] / maxCorr) * (canvas.height - 10) : 0);
+                if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+            }
+            ctx2d.stroke();
+        };
+
+        // 绑定校准点击事件
+        document.getElementById('calibrateBtn').onclick = () => {
+            if (latestPeakFine === 0) {
+                alert("尚未检测到有效信号峰，请确保发射端正在播放且麦克风能收到声音！");
+                return;
+            }
+            t0_samples = latestPeakFine;
+            const currentd0 = document.getElementById('d0Input').value;
+            document.getElementById('calibStatus').innerHTML = `✅ <b style="color: #10b981;">已成功标定！</b> 初始距离 d0 = ${currentd0}m, 基准 t0 采样点 = ${t0_samples.toFixed(1)}`;
+        };
+
+    } catch (err) {
+        alert("无法获取麦克风权限！请确保使用 localhost 或 HTTPS 协议访问。");
+        console.error(err);
+    }
+};
+</script>
+</body>
+</html>
