@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gold 序列强力捕获调试器</title>
+<style>
+  body { background: #0f172a; color: #f8fafc; font-family: sans-serif; padding: 20px; max-width: 500px; margin: 0 auto; }
+  .card { background: #1e293b; padding: 20px; border-radius: 12px; margin-bottom: 15px; }
+  button { width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 1.1rem; font-weight: bold; cursor: pointer; margin-top: 10px; }
+  .btn-green { background: #10b981; color: white; }
+  .btn-red { background: #ef4444; color: white; }
+  .log-box { background: #090d16; padding: 12px; border-radius: 8px; height: 180px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; color: #38bdf8; margin-top: 10px; }
+  .metric { font-size: 2rem; font-weight: bold; color: #38bdf8; text-align: center; margin: 10px 0; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h2>📡 Gold 序列捕获测试器</h2>
+  <p style="font-size: 0.85rem; color: #94a3b8; margin-top: 5px;">用于排查手机底层麦克风是否能成功识别高频 MFSK 信号。</p>
+  
+  <div class="metric" id="status-text">未启动</div>
+  <div style="font-size: 0.9rem; text-align: center; color: #94a3b8;">当前最大互相关峰值: <span id="peak-val" style="color:#fff; font-weight:bold;">0</span> / 63</div>
+  
+  <button id="main-btn" class="btn-green" onclick="toggleSystem()">启动麦克风监听</button>
+</div>
+
+<div class="card">
+  <h3>实时捕获日志</h3>
+  <div id="log-container" class="log-box">等待启动...</div>
+</div>
+
+<script>
+const SAMPLE_RATE = 48000;
+const CHIP_RATE = 200; // 降低码元速率至 200 Hz，增大每个符号的采样宽度（240点），极大地增强硬件容错抗多径能力
+const SAMPLES_PER_SYM = Math.floor(SAMPLE_RATE / CHIP_RATE); 
+const GOLD_LEN = 63;
+const FREQS = [12000, 13500, 15000, 16500];
+
+// 生成 63 位 Gold 序列 (+1 / -1)
+function generateGoldSequence() {
+  let reg1 = 0x3F, reg2 = 0x3F;
+  const gold = new Int8Array(GOLD_LEN);
+  for (let i = 0; i < GOLD_LEN; i++) {
+    const bit1 = reg1 & 1;
+    const bit2 = reg2 & 1;
+    gold[i] = (bit1 ^ bit2) === 1 ? 1 : -1;
+    reg1 = ((reg1 << 1) | (((reg1 >> 5) ^ (reg1 >> 0)) & 1)) & 0x3F;
+    reg2 = ((reg2 << 1) | (((reg2 >> 5) ^ (reg2 >> 4) ^ (reg2 >> 1) ^ (reg2 >> 0)) & 1)) & 0x3F;
+  }
+  return gold;
+}
+const GOLD_TEMPLATE = generateGoldSequence();
+
+let audioCtx = null;
+let mediaStream = null;
+let processor = null;
+let isRunning = false;
+
+function log(msg) {
+  const box = document.getElementById('log-container');
+  box.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+  box.scrollTop = box.scrollHeight;
+}
+
+// Goertzel 频点能量检测
+function goertzel(samples, startIdx, length, targetFreq, sampleRate) {
+  const k = Math.round((length * targetFreq) / sampleRate);
+  const omega = (2 * Math.PI * k) / length;
+  const coeff = 2 * Math.cos(omega);
+  let s0 = 0, s1 = 0, s2 = 0;
+  for (let i = 0; i < length; i++) {
+    const win = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (length - 1)));
+    s0 = samples[startIdx + i] * win + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+async function toggleSystem() {
+  const btn = document.getElementById('main-btn');
+  if (!isRunning) {
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SAMPLE_RATE }
+      });
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+
+      // 使用更大的缓冲区（4096）收集足够长度的音频进行块扫描
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      
+      let audioBuffer = [];
+      processor.onaudioprocess = (e) => {
+        if (!isRunning) return;
+        const input = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < input.length; i++) {
+          audioBuffer.push(input[i]);
+        }
+
+        // 当收集到约 0.5 秒的音频时，执行一次完整的 Gold 序列滑动匹配
+        if (audioBuffer.length >= 24000) {
+          runMatching(new Float32Array(audioBuffer), audioCtx.sampleRate);
+          // 保留后半段作为滚动窗口
+          audioBuffer = audioBuffer.slice(12000);
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      isRunning = true;
+      btn.innerText = "停止监听";
+      btn.className = "btn btn-red";
+      document.getElementById('status-text').innerText = "正在监听高频...";
+      log("麦克风已成功开启，等待接收发射端的 Gold 序列...");
+    } catch (err) {
+      alert("麦克风启动失败: " + err.message);
+      log("错误: " + err.message);
+    }
+  } else {
+    isRunning = false;
+    if (processor) processor.disconnect();
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    if (audioCtx) audioCtx.close();
+    btn.innerText = "启动麦克风监听";
+    btn.className = "btn btn-green";
+    document.getElementById('status-text').innerText = "已停止";
+    log("监听已关闭。");
+  }
+}
+
+function runMatching(samples, sampleRate) {
+  const numSymbols = Math.ceil(GOLD_LEN / 2); // 32 个符号
+  const totalNeededSamples = numSymbols * SAMPLES_PER_SYM;
+  
+  if (samples.length < totalNeededSamples) return;
+
+  let bestPeak = -999;
+  
+  // 暴力滑动匹配整个缓冲区
+  const maxSteps = samples.length - totalNeededSamples;
+  for (let step = 0; step < maxSteps; step += 10) { // 步进 10 个采样点
+    let dotProduct = 0;
+
+    for (let s = 0; s < numSymbols; s++) {
+      const symStart = step + s * SAMPLES_PER_SYM;
+      let maxE = -1, bestTone = 0;
+      for (let f = 0; f < 4; f++) {
+        const e = goertzel(samples, symStart, SAMPLES_PER_SYM, FREQS[f], sampleRate);
+        if (e > maxE) { maxE = e; bestTone = f; }
+      }
+
+      const b1 = (bestTone >> 1) & 1;
+      const b2 = bestTone & 1;
+      
+      const expectedBit1 = (s * 2 < GOLD_LEN) ? GOLD_TEMPLATE[s * 2] : 1;
+      const expectedBit2 = (s * 2 + 1 < GOLD_LEN) ? GOLD_TEMPLATE[s * 2 + 1] : 1;
+
+      dotProduct += (b1 === 1 ? 1 : -1) * expectedBit1 + (b2 === 1 ? 1 : -1) * expectedBit2;
+    }
+
+    if (dotProduct > bestPeak) {
+      bestPeak = dotProduct;
+    }
+  }
+
+  document.getElementById('peak-val').innerText = bestPeak;
+
+  // 门限判定：若峰值超过 40，说明成功捕获到 Gold 序列！
+  if (bestPeak >= 40) {
+    document.getElementById('status-text').innerText = "🎯 成功捕获序列！";
+    document.getElementById('status-text').style.color = "#10b981";
+    log(`🎉 成功捕捉！当前最高互相关峰值: ${bestPeak} / 63`);
+  } else {
+    document.getElementById('status-text').innerText = "正在搜寻...";
+    document.getElementById('status-text').style.color = "#38bdf8";
+  }
+}
+</script>
+</body>
+</html>
