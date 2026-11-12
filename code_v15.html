@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>声波测距 v2 · 稳定版（gold 序列 · BPSK · 匹配滤波）</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 680px; margin: 0 auto; padding: 16px; background: #111; color: #eee; }
+  h1 { font-size: 20px; }
+  .panel { background: #1c1c1e; border-radius: 12px; padding: 16px; margin: 12px 0; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  button { font-size: 16px; padding: 10px 16px; border: none; border-radius: 8px; background: #0a84ff; color: #fff; cursor: pointer; }
+  button.secondary { background: #3a3a3c; }
+  button:disabled { opacity: .4; }
+  .big { font-size: 48px; font-weight: bold; text-align: center; margin: 14px 0; font-variant-numeric: tabular-nums; }
+  .muted { color: #8e8e93; font-size: 13px; line-height: 1.5; }
+  .tag { font-size: 13px; padding: 3px 10px; border-radius: 12px; background: #2c2c2e; }
+  .good { color: #30d158; } .bad { color: #ff453a; } .warn { color: #ffd60a; }
+  input[type=range] { flex: 1; }
+  input[type=checkbox] { width: 18px; height: 18px; }
+</style>
+</head>
+<body>
+<h1>🔊 声波测距 v2（稳定版）</h1>
+
+<div class="panel">
+  <div class="row">
+    <b>选择本机角色：</b>
+    <button id="btnBeacon">📡 信标（发射）</button>
+    <button id="btnRanger">🎯 测距（接收）</button>
+  </div>
+  <div class="muted">两台手机打开同一页面：一台做信标、一台做测距。建议两台是同一系统（都安卓或都 iPhone）。</div>
+</div>
+
+<div class="panel" id="beaconPanel" style="display:none">
+  <div class="row">
+    <button id="btnStartBeacon">▶ 开始发射</button>
+    <button id="btnStopBeacon" class="secondary">■ 停止</button>
+    <span id="beaconStatus" class="muted"></span>
+  </div>
+  <div class="row">
+    <span>音量</span>
+    <input type="range" id="beaconGain" min="0" max="100" value="80" />
+  </div>
+  <div class="muted">⚠️ 把系统音量调到最大。信号频段约 5.5–8.5 kHz，可闻（轻微“沙沙”声），属正常。</div>
+</div>
+
+<div class="panel" id="rangerPanel" style="display:none">
+  <div class="row">
+    <button id="btnStartRanger">▶ 开始测距</button>
+    <button id="btnStopRanger" class="secondary">■ 停止</button>
+    <button id="btnCalibrate" class="secondary">📍 校准（设为 0）</button>
+    <span id="rangerStatus" class="muted"></span>
+  </div>
+  <div class="big" id="distDisplay">—</div>
+  <div class="row" style="justify-content:space-between">
+    <span class="tag" id="qualTag">信号质量：—</span>
+    <span class="tag" id="lagTag">相关峰：—</span>
+    <span class="tag" id="stabTag">抖动：—</span>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="firstPeakToggle" checked /> 首径检测（抗多径，推荐开启）</label>
+  </div>
+  <div class="muted">
+    用法：把两台手机贴近（或已知距离处）点「校准」，随后移动测距手机，显示相对校准点的距离。<br/>
+    正数 = 比校准点更远；负数 = 更近。移动要慢一点，读数更稳。<br/>
+    <b>「抖动」指标请在手机静止时看</b>，它反映本方案的稳定性下限。受 Web Audio 延迟抖动限制，仍是分米~米级。
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ================= 信号参数 =================
+const CARRIER = 7000;          // 目标载波 Hz（实际按整数周期微调）
+const CODE_LEN = 128;          // 码片数 = 127 位 gold 码 + 1 位补足
+const CHIP_SAMPLES = 32;       // 每码片采样数 → 码率 = fs/32（48kHz 下 1500Hz）
+const N_REF = CODE_LEN * CHIP_SAMPLES; // 4096 = 一个码周期采样数 = 2^12（FFT 大小）
+const K_SEG = 8;               // 相关累加的码周期数（v2：6 → 8，更多积分）
+const WIN_LEN = K_SEG * N_REF; // 32768 采样 ≈ 683ms
+const SOUND_SPEED = 343;       // 声速 m/s
+const HISTORY = 9;             // 中位数滤波窗口
+const EMA_ALPHA = 0.30;        // 相关包络指数平均系数（越小越平滑）
+const OUTLIER_SAMPLES = 250;   // 离群点剔除阈值（采样，约 1.8m 突变才拒绝）
+
+// ================= gold 码生成（m 序列 LFSR，Galois 型） =================
+function lfsrMSeq(n, tapmask, length) {
+  let state = (1 << n) - 1;
+  const out = new Array(length);
+  for (let i = 0; i < length; i++) {
+    out[i] = state & 1;
+    let t = state & tapmask, fb = 0;
+    while (t) { fb ^= (t & 1); t >>= 1; }
+    state = (state >> 1) | (fb << (n - 1));
+  }
+  return out;
+}
+
+const m1 = lfsrMSeq(7, 0b1001, 127);
+const m2 = lfsrMSeq(7, 0b1111, 127);
+const chips = new Array(CODE_LEN);
+for (let i = 0; i < 127; i++) chips[i] = (m1[i] ^ m2[i]) ? 1 : -1;
+chips[127] = chips[0];
+
+// ================= 全局状态 =================
+let audioCtx = null, fs = 48000;
+let refI = null, refQ = null, carrier = 0;
+let R_I_re, R_I_im, R_Q_re, R_Q_im;
+let win = null, filled = 0;
+let accEnv, emaEnv, s_re, s_im, cI_re, cI_im, cQ_re, cQ_im;
+let prevRawLag = 0, unwrappedLag = 0, calibLag = 0, calibrated = false;
+let lagHistory = [], recentLags = [];
+let rangerRunning = false, beaconRunning = false;
+let captureNode = null, beaconSrc = null, beaconGainNode = null, micStream = null;
+let lastCorr = 0;
+
+// ================= FFT（迭代 radix-2，原地） =================
+function fftInPlace(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wRe = Math.cos(ang), wIm = Math.sin(ang);
+    const half = len >> 1;
+    for (let i = 0; i < n; i += len) {
+      let cRe = 1, cIm = 0;
+      for (let j = 0; j < half; j++) {
+        const a = i + j, b = i + j + half;
+        const tRe = re[b] * cRe - im[b] * cIm;
+        const tIm = re[b] * cIm + im[b] * cRe;
+        re[b] = re[a] - tRe; im[b] = im[a] - tIm;
+        re[a] += tRe; im[a] += tIm;
+        const nRe = cRe * wRe - cIm * wIm;
+        const nIm = cRe * wIm + cIm * wRe;
+        cRe = nRe; cIm = nIm;
+      }
+    }
+  }
+}
+
+function ifftInPlace(re, im) {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fftInPlace(re, im);
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+}
+
+// ================= 参考信号构建 =================
+function buildReference() {
+  carrier = Math.round(CARRIER * N_REF / fs) * fs / N_REF;
+  refI = new Float32Array(N_REF);
+  refQ = new Float32Array(N_REF);
+  for (let i = 0; i < N_REF; i++) {
+    const chip = chips[Math.floor(i / CHIP_SAMPLES)];
+    const ph = 2 * Math.PI * carrier * i / fs;
+    refI[i] = chip * Math.cos(ph);
+    refQ[i] = chip * Math.sin(ph);
+  }
+  R_I_re = Float32Array.from(refI); R_I_im = new Float32Array(N_REF);
+  R_Q_re = Float32Array.from(refQ); R_Q_im = new Float32Array(N_REF);
+  fftInPlace(R_I_re, R_I_im);
+  fftInPlace(R_Q_re, R_Q_im);
+}
+
+function initRangerBuffers() {
+  win = new Float32Array(WIN_LEN); filled = 0;
+  accEnv = new Float32Array(N_REF);
+  emaEnv = new Float32Array(N_REF);
+  s_re = new Float32Array(N_REF); s_im = new Float32Array(N_REF);
+  cI_re = new Float32Array(N_REF); cI_im = new Float32Array(N_REF);
+  cQ_re = new Float32Array(N_REF); cQ_im = new Float32Array(N_REF);
+  prevRawLag = 0; unwrappedLag = 0; calibrated = false; calibLag = 0;
+  lagHistory = []; recentLags = []; lastCorr = 0;
+}
+
+// ================= 匹配滤波（非相干 IQ，多周期累加） =================
+function computeCorrelation() {
+  accEnv.fill(0);
+  for (let m = 0; m < K_SEG; m++) {
+    const off = m * N_REF;
+    for (let i = 0; i < N_REF; i++) { s_re[i] = win[off + i]; s_im[i] = 0; }
+    fftInPlace(s_re, s_im);
+    for (let k = 0; k < N_REF; k++) {
+      const a = s_re[k], b = s_im[k];
+      const c = R_I_re[k], d = R_I_im[k];
+      cI_re[k] = a * c + b * d; cI_im[k] = b * c - a * d;
+    }
+    ifftInPlace(cI_re, cI_im);
+    for (let k = 0; k < N_REF; k++) {
+      const a = s_re[k], b = s_im[k];
+      const c = R_Q_re[k], d = R_Q_im[k];
+      cQ_re[k] = a * c + b * d; cQ_im[k] = b * c - a * d;
+    }
+    ifftInPlace(cQ_re, cQ_im);
+    for (let l = 0; l < N_REF; l++) accEnv[l] += cI_re[l] * cI_re[l] + cQ_re[l] * cQ_re[l];
+  }
+}
+
+// ================= 首径检测（抗多径） + 抛物线插值 =================
+function findFirstPeak(env, N, thresholdFrac) {
+  let mi = 0;
+  for (let l = 1; l < N; l++) if (env[l] > env[mi]) mi = l;
+  const thresh = env[mi] * thresholdFrac;
+  for (let l = 0; l < N; l++) {                 // 从最早时延扫起，取首个显著峰 = 直射径
+    if (env[l] < thresh) continue;
+    let isMax = true;
+    for (let k = 1; k <= 4; k++) {
+      if (env[(l - k + N) % N] > env[l] || env[(l + k) % N] > env[l]) { isMax = false; break; }
+    }
+    if (isMax) return l;
+  }
+  return mi;
+}
+
+function locatePeak(env, useFirstPeak) {
+  const idx = useFirstPeak ? findFirstPeak(env, N_REF, 0.55) : (() => {
+    let m = 0; for (let l = 1; l < N_REF; l++) if (env[l] > env[m]) m = l; return m;
+  })();
+  const y0 = env[(idx - 1 + N_REF) % N_REF], y1 = env[idx], y2 = env[(idx + 1) % N_REF];
+  const denom = y0 - 2 * y1 + y2;
+  let delta = 0;
+  if (denom !== 0) delta = 0.5 * (y0 - y2) / denom;
+  const lag = ((idx + delta) % N_REF + N_REF) % N_REF;
+  return { lag, peak: y1 };
+}
+
+// ================= 时延解缠 + 中位数滤波 + 离群剔除 =================
+function median(arr) {
+  const s = arr.slice().sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
+}
+
+function updateLag(lag) {
+  let d = lag - prevRawLag;
+  if (d > N_REF / 2) d -= N_REF; else if (d < -N_REF / 2) d += N_REF;
+  const candidate = unwrappedLag + d;
+  if (lagHistory.length >= 3) {                  // 离群点剔除
+    const med = median(lagHistory);
+    if (Math.abs(candidate - med) > OUTLIER_SAMPLES) return med;
+  }
+  prevRawLag = lag;
+  unwrappedLag = candidate;
+  lagHistory.push(unwrappedLag);
+  if (lagHistory.length > HISTORY) lagHistory.shift();
+  return median(lagHistory);
+}
+
+// ================= 处理一帧 =================
+function processResult() {
+  computeCorrelation();
+  for (let l = 0; l < N_REF; l++) emaEnv[l] = EMA_ALPHA * accEnv[l] + (1 - EMA_ALPHA) * emaEnv[l]; // 包络时间平均
+
+  const useFirst = document.getElementById('firstPeakToggle').checked;
+  const { lag, peak } = locatePeak(emaEnv, useFirst);
+
+  let mean = 0; for (let l = 0; l < N_REF; l++) mean += emaEnv[l]; mean /= N_REF;
+  const quality = peak / mean;
+
+  const smoothed = updateLag(lag);
+  recentLags.push(unwrappedLag);
+  if (recentLags.length > 20) recentLags.shift();
+
+  document.getElementById('lagTag').textContent = '相关峰：' + lag.toFixed(1) + ' 采样';
+  const q = document.getElementById('qualTag');
+  q.textContent = '信号质量：' + quality.toFixed(0);
+  q.className = 'tag ' + (quality > 30 ? 'good' : (quality > 15 ? 'warn' : 'bad'));
+
+  if (recentLags.length >= 5) {                  // 静止抖动指标（cm）
+    const m = recentLags.reduce((a, b) => a + b, 0) / recentLags.length;
+    const v = recentLags.reduce((a, b) => a + (b - m) * (b - m), 0) / recentLags.length;
+    const stdCm = Math.sqrt(v) / fs * SOUND_SPEED * 100;
+    document.getElementById('stabTag').textContent = '抖动 ±' + stdCm.toFixed(1) + ' cm';
+  }
+
+  if (!calibrated) { document.getElementById('distDisplay').textContent = '未校准'; return; }
+  const ds = (smoothed - calibLag) / fs * SOUND_SPEED;
+  document.getElementById('distDisplay').textContent = ds.toFixed(2) + ' m';
+}
+
+// ================= 音频采集（AudioWorklet 优先，ScriptProcessor 回退） =================
+const workletCode = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() { super(); this.chunk = new Float32Array(4096); this.ptr = 0; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) {
+        this.chunk[this.ptr++] = ch[i];
+        if (this.ptr === 4096) { this.port.postMessage(this.chunk.slice()); this.ptr = 0; }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('capture-proc', CaptureProcessor);
+`;
+
+function handleChunk(chunk) {
+  win.copyWithin(0, chunk.length);
+  win.set(chunk, WIN_LEN - chunk.length);
+  filled = Math.min(filled + chunk.length, WIN_LEN);
+  const now = performance.now();
+  if (filled >= WIN_LEN && now - lastCorr > 120) { lastCorr = now; processResult(); }
+}
+
+// ================= UI =================
+const $ = id => document.getElementById(id);
+$('btnBeacon').onclick = () => { $('beaconPanel').style.display = 'block'; $('rangerPanel').style.display = 'none'; };
+$('btnRanger').onclick = () => { $('rangerPanel').style.display = 'block'; $('beaconPanel').style.display = 'none'; };
+
+function ensureCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    fs = audioCtx.sampleRate;
+    buildReference();
+    console.log('[信息] 采样率=%d Hz, 载波=%.1f Hz, 码周期=%d 采样 (%.1f ms)',
+      fs, carrier, N_REF, N_REF / fs * 1000);
+  }
+}
+
+// ----- 信标 -----
+$('btnStartBeacon').onclick = async () => {
+  try {
+    ensureCtx();
+    await audioCtx.resume();
+    if (beaconRunning) return;
+    const buf = audioCtx.createBuffer(1, N_REF, fs);
+    buf.getChannelData(0).set(refI);
+    beaconSrc = audioCtx.createBufferSource();
+    beaconSrc.buffer = buf; beaconSrc.loop = true;
+    beaconGainNode = audioCtx.createGain();
+    beaconGainNode.gain.value = parseFloat($('beaconGain').value) / 100;
+    beaconSrc.connect(beaconGainNode); beaconGainNode.connect(audioCtx.destination);
+    beaconSrc.start();
+    beaconRunning = true;
+    $('beaconStatus').textContent = '发射中 · 载波 ' + carrier.toFixed(0) + ' Hz';
+  } catch (e) { alert('启动失败：' + e.message); }
+};
+$('btnStopBeacon').onclick = () => {
+  if (beaconSrc) { try { beaconSrc.stop(); } catch (e) {} beaconSrc.disconnect(); beaconSrc = null; }
+  beaconRunning = false; $('beaconStatus').textContent = '已停止';
+};
+$('beaconGain').addEventListener('input', e => { if (beaconGainNode) beaconGainNode.gain.value = parseFloat(e.target.value) / 100; });
+
+// ----- 测距 -----
+$('btnStartRanger').onclick = async () => {
+  try {
+    ensureCtx();
+    await audioCtx.resume();
+    initRangerBuffers();
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 }
+    });
+    const srcNode = audioCtx.createMediaStreamSource(micStream);
+    const mute = audioCtx.createGain(); mute.gain.value = 0;
+    mute.connect(audioCtx.destination);
+
+    let mode = 'ScriptProcessor';
+    if (audioCtx.audioWorklet) {
+      try {
+        const url = URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }));
+        await audioCtx.audioWorklet.addModule(url);
+        const node = new AudioWorkletNode(audioCtx, 'capture-proc');
+        node.port.onmessage = e => handleChunk(e.data);
+        srcNode.connect(node); node.connect(mute);
+        captureNode = node; mode = 'AudioWorklet';
+      } catch (e) { console.warn('AudioWorklet 不可用，回退 ScriptProcessor：', e); }
+    }
+    if (!captureNode) {
+      const sp = audioCtx.createScriptProcessor(4096, 1, 1);
+      sp.onaudioprocess = e => handleChunk(e.inputBuffer.getChannelData(0));
+      srcNode.connect(sp); sp.connect(mute);
+      captureNode = sp;
+    }
+    rangerRunning = true;
+    console.log('[信息] 采集模式 =', mode);
+    $('distDisplay').textContent = '未校准';
+    $('rangerStatus').textContent = '接收中（' + mode + '）…';
+  } catch (e) { alert('启动失败（需授权麦克风）：' + e.message); }
+};
+
+$('btnCalibrate').onclick = () => {
+  if (!rangerRunning || lagHistory.length === 0) return;
+  calibLag = median(lagHistory);
+  calibrated = true;
+  $('rangerStatus').textContent = '已校准（相对 0）';
+  $('distDisplay').textContent = '0.00 m';
+};
+
+$('btnStopRanger').onclick = () => {
+  if (captureNode) { try { captureNode.disconnect(); } catch (e) {} captureNode = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  rangerRunning = false;
+  $('rangerStatus').textContent = '已停止';
+  $('distDisplay').textContent = '—';
+};
+</script>
+</body>
+</html>
