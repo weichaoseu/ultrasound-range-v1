@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>声学测距系统 (稳定捕获与防抖版)</title>
+<style>
+  :root {
+    --bg: #0f172a; --card: #1e293b; --primary: #38bdf8;
+    --success: #10b981; --danger: #ef4444; --warning: #f59e0b;
+    --text: #f8fafc; --muted: #94a3b8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { background: var(--bg); color: var(--text); padding: 16px; max-width: 600px; margin: 0 auto; }
+  h1 { font-size: 1.2rem; text-align: center; margin-bottom: 14px; color: var(--primary); }
+  .tabs { display: flex; gap: 10px; margin-bottom: 14px; }
+  .tab-btn {
+    flex: 1; padding: 12px; border: none; border-radius: 10px; font-size: 1rem; font-weight: 600;
+    background: var(--card); color: var(--muted); cursor: pointer;
+  }
+  .tab-btn.active { background: var(--primary); color: #0f172a; }
+  .panel { display: none; background: var(--card); padding: 18px; border-radius: 14px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+  .panel.active { display: block; }
+  .btn {
+    width: 100%; padding: 14px; border: none; border-radius: 10px; font-size: 1.05rem; font-weight: bold;
+    cursor: pointer; margin-top: 10px;
+  }
+  .btn-start { background: var(--success); color: #fff; }
+  .btn-stop { background: var(--danger); color: #fff; }
+  .btn-cal { background: var(--warning); color: #0f172a; }
+  .metric-box {
+    background: #0f172a; border-radius: 12px; padding: 16px; text-align: center; margin: 12px 0;
+    border: 1px solid #334155;
+  }
+  .distance-val { font-size: 3rem; font-weight: 800; color: var(--primary); font-variant-numeric: tabular-nums; }
+  .unit { font-size: 1.1rem; color: var(--muted); }
+  .status-badge {
+    display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; margin-top: 8px;
+  }
+  .status-valid { background: rgba(16, 185, 129, 0.2); color: var(--success); }
+  .status-reject { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+  .grid-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .stat-item { background: #0f172a; padding: 10px; border-radius: 8px; font-size: 0.85rem; color: var(--muted); }
+  .stat-item span { display: block; font-size: 1.1rem; font-weight: bold; color: #fff; margin-top: 4px; }
+  .control-row { margin: 12px 0; font-size: 0.9rem; }
+  .control-row label { display: flex; justify-content: space-between; margin-bottom: 6px; color: var(--muted); }
+  input[type="range"] { width: 100%; accent-color: var(--primary); }
+  input[type="number"] {
+    width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155;
+    background: #0f172a; color: #fff; font-size: 1rem; margin-top: 4px;
+  }
+  canvas { width: 100%; height: 110px; background: #0f172a; border-radius: 8px; margin-top: 10px; border: 1px solid #334155; }
+  .info-text { font-size: 0.8rem; color: var(--muted); line-height: 1.5; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<h1>📡 声学测距系统 (稳定捕获与防抖版)</h1>
+
+<div class="tabs">
+  <button class="tab-btn active" onclick="switchMode('tx')">📱 发射端 (TX)</button>
+  <button class="tab-btn" onclick="switchMode('rx')">🎙️ 接收端 (RX)</button>
+</div>
+
+<!-- 发射端 -->
+<div id="panel-tx" class="panel active">
+  <p class="info-text">将手机媒体音量调至 <b>80%</b>，使用高频静默区（12kHz~16.5kHz）。</p>
+  <div class="metric-box">
+    <div style="font-size:0.9rem; color:var(--muted);">发射周期</div>
+    <div class="distance-val" style="font-size:1.8rem;">200 <span class="unit">ms / 帧</span></div>
+    <div id="tx-status" class="status-badge status-reject">未发射</div>
+  </div>
+  <button id="btn-tx-toggle" class="btn btn-start" onclick="toggleTX()">开始发射声波</button>
+</div>
+
+<!-- 接收端 -->
+<div id="panel-rx" class="panel">
+  <div class="metric-box">
+    <div style="font-size:0.85rem; color:var(--muted);">实时测距结果 (防抖平滑)</div>
+    <div class="distance-val"><span id="ui-dist">--.--</span> <span class="unit">cm</span></div>
+    <div id="ui-badge" class="status-badge status-reject">等待接收信号...</div>
+  </div>
+
+  <div class="grid-stats">
+    <div class="stat-item">互相关峰值 (满分63)<span id="ui-peak">0</span></div>
+    <div class="stat-item">当前误码数 E<span id="ui-errors">--</span></div>
+    <div class="stat-item">细化步进 Lag<span id="ui-lag">0.00</span></div>
+    <div class="stat-item">有效捕获率<span id="ui-rate">0%</span></div>
+  </div>
+
+  <div class="control-row">
+    <label>
+      <span>最大允许误码数 E（门限：<b id="lbl-thresh">43</b>）</span>
+      <span><b id="lbl-max-err">10</b> bit</span>
+    </label>
+    <input type="range" id="slider-err" min="0" max="20" value="10" oninput="updateThreshold()">
+  </div>
+
+  <div class="control-row">
+    <label><span>基准校准距离 d₀ (cm)：两机对齐后输入并点击校准</span></label>
+    <div style="display:flex; gap:8px;">
+      <input type="number" id="input-d0" value="30.0" step="1" style="flex:1;">
+      <button class="btn btn-cal" style="flex:1.2; margin-top:4px; padding:10px;" onclick="calibrateZero()">一键基准校准</button>
+    </div>
+  </div>
+
+  <canvas id="corr-canvas"></canvas>
+
+  <button id="btn-rx-toggle" class="btn btn-start" onclick="toggleRX()">启动接收测距</button>
+</div>
+
+<script>
+const SAMPLE_RATE = 48000;
+const SOUND_SPEED = 34300; // cm/s
+const CHIP_RATE = 400;     // 400 symbols/sec
+const SAMPLES_PER_SYM = Math.floor(SAMPLE_RATE / CHIP_RATE); // 120
+const GOLD_LEN = 63;
+const FREQS = [12000, 13500, 15000, 16500]; // 成功捕获的高频静默区
+const FRAME_INTERVAL_MS = 200;
+
+// 生成 63 位 Gold 序列
+function generateGoldSequence() {
+  let reg1 = 0x3F, reg2 = 0x3F;
+  const gold = new Int8Array(GOLD_LEN);
+  for (let i = 0; i < GOLD_LEN; i++) {
+    const bit1 = reg1 & 1;
+    const bit2 = reg2 & 1;
+    gold[i] = (bit1 ^ bit2) === 1 ? 1 : -1;
+    reg1 = ((reg1 << 1) | (((reg1 >> 5) ^ (reg1 >> 0)) & 1)) & 0x3F;
+    reg2 = ((reg2 << 1) | (((reg2 >> 5) ^ (reg2 >> 4) ^ (reg2 >> 1) ^ (reg2 >> 0)) & 1)) & 0x3F;
+  }
+  return gold;
+}
+const GOLD_TEMPLATE = generateGoldSequence();
+
+function encodeGoldToSymbols(goldSeq) {
+  const numSyms = Math.ceil(goldSeq.length / 2);
+  const syms = new Uint8Array(numSyms);
+  for (let i = 0; i < numSyms; i++) {
+    const b1 = goldSeq[i * 2] === 1 ? 1 : 0;
+    const b2 = (i * 2 + 1 < goldSeq.length) ? (goldSeq[i * 2 + 1] === 1 ? 1 : 0) : 0;
+    syms[i] = (b1 << 1) | b2;
+  }
+  return syms;
+}
+const TX_SYMBOLS = encodeGoldToSymbols(GOLD_TEMPLATE);
+
+function switchMode(mode) {
+  document.querySelectorAll('.tab-btn').forEach((b, idx) => {
+    b.classList.toggle('active', (mode === 'tx' && idx === 0) || (mode === 'rx' && idx === 1));
+  });
+  document.getElementById('panel-tx').classList.toggle('active', mode === 'tx');
+  document.getElementById('panel-rx').classList.toggle('active', mode === 'rx');
+}
+
+let maxAllowedErrors = 10;
+let peakThreshold = GOLD_LEN - 2 * maxAllowedErrors; // 43
+
+function updateThreshold() {
+  maxAllowedErrors = parseInt(document.getElementById('slider-err').value);
+  peakThreshold = GOLD_LEN - 2 * maxAllowedErrors;
+  document.getElementById('lbl-max-err').innerText = maxAllowedErrors;
+  document.getElementById('lbl-thresh').innerText = peakThreshold;
+}
+
+// 发射端
+let txCtx = null, txTimer = null, isTxRunning = false;
+function createTxBuffer(ctx) {
+  const frameSamples = Math.floor(ctx.sampleRate * (FRAME_INTERVAL_MS / 1000));
+  const buffer = ctx.createBuffer(1, frameSamples, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  let offset = 0;
+  for (let s = 0; s < TX_SYMBOLS.length; s++) {
+    const freq = FREQS[TX_SYMBOLS[s]];
+    for (let n = 0; n < SAMPLES_PER_SYM; n++) {
+      if (offset + n < frameSamples) {
+        const env = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (SAMPLES_PER_SYM - 1)));
+        data[offset + n] = 0.85 * env * Math.sin(2 * Math.PI * freq * (n / ctx.sampleRate));
+      }
+    }
+    offset += SAMPLES_PER_SYM;
+  }
+  return buffer;
+}
+
+function toggleTX() {
+  const btn = document.getElementById('btn-tx-toggle');
+  const status = document.getElementById('tx-status');
+  if (!isTxRunning) {
+    txCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    const txBuffer = createTxBuffer(txCtx);
+    const playBurst = () => {
+      if (!isTxRunning) return;
+      const src = txCtx.createBufferSource();
+      src.buffer = txBuffer;
+      src.connect(txCtx.destination);
+      src.start();
+    };
+    isTxRunning = true;
+    playBurst();
+    txTimer = setInterval(playBurst, FRAME_INTERVAL_MS);
+    btn.innerText = "停止发射声波";
+    btn.className = "btn btn-stop";
+    status.innerText = "正在发射...";
+    status.className = "status-badge status-valid";
+  } else {
+    isTxRunning = false;
+    clearInterval(txTimer);
+    if (txCtx) txCtx.close();
+    btn.innerText = "开始发射声波";
+    btn.className = "btn btn-start";
+    status.innerText = "未发射";
+    status.className = "status-badge status-reject";
+  }
+}
+
+// 接收端：恢复上一版能成功捕获的精简稳健架构，增加 4 倍过采样微步进与防抖平滑
+let rxCtx = null, rxStream = null, rxProcessor = null, isRxRunning = false;
+const RING_SIZE = 19200;
+let ringBuffer = new Float32Array(RING_SIZE);
+let ringWritePtr = 0;
+
+let lastValidDistance = null;
+let rawTimeOffset = null;
+let calibratedT0 = null;
+let calibratedD0 = 30.0;
+let totalFrames = 0, validFrames = 0;
+
+function calibrateZero() {
+  if (rawTimeOffset === null) {
+    alert("尚未捕捉到有效信号！");
+    return;
+  }
+  calibratedD0 = parseFloat(document.getElementById('input-d0').value) || 30.0;
+  calibratedT0 = rawTimeOffset;
+  lastValidDistance = calibratedD0;
+  document.getElementById('ui-dist').innerText = calibratedD0.toFixed(1);
+}
+
+function goertzelEnergy(samples, startIdx, length, targetFreq, sampleRate) {
+  const k = Math.round((length * targetFreq) / sampleRate);
+  const omega = (2 * Math.PI * k) / length;
+  const coeff = 2 * Math.cos(omega);
+  let s0 = 0, s1 = 0, s2 = 0;
+  for (let i = 0; i < length; i++) {
+    const win = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (length - 1)));
+    s0 = samples[startIdx + i] * win + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+function processAudioFrame(actualSampleRate) {
+  totalFrames++;
+  const linearSamples = new Float32Array(RING_SIZE);
+  for (let i = 0; i < RING_SIZE; i++) {
+    linearSamples[i] = ringBuffer[(ringWritePtr + i) % RING_SIZE];
+  }
+
+  // 恢复上一版成功的 4 过采样微步进机制（既保证能稳定捕获，又比最初的粗网格更精细）
+  const samplesPerSym = Math.floor(actualSampleRate / CHIP_RATE);
+  const OVERSAMPLE = 4;
+  const hopSize = Math.floor(samplesPerSym / OVERSAMPLE);
+  const numSteps = Math.floor((RING_SIZE - samplesPerSym) / hopSize);
+
+  const demodSyms = new Uint8Array(numSteps);
+  for (let i = 0; i < numSteps; i++) {
+    const startIdx = i * hopSize;
+    let maxEnergy = -1, bestTone = 0;
+    for (let fIdx = 0; fIdx < 4; fIdx++) {
+      const e = goertzelEnergy(linearSamples, startIdx, samplesPerSym, FREQS[fIdx], actualSampleRate);
+      if (e > maxEnergy) { maxEnergy = e; bestTone = fIdx; }
+    }
+    demodSyms[i] = bestTone;
+  }
+
+  const symsNeeded = TX_SYMBOLS.length;
+  const maxLagSteps = numSteps - symsNeeded * OVERSAMPLE;
+  const corrCurve = new Int16Array(maxLagSteps);
+
+  let bestPeak = -999;
+  let bestLagIdx = 0;
+
+  for (let lag = 0; lag < maxLagSteps; lag++) {
+    let dotProduct = 0;
+    for (let k = 0; k < GOLD_LEN; k++) {
+      const symPos = Math.floor(k / 2);
+      const isSecondBit = (k % 2) === 1;
+      const detectedSym = demodSyms[lag + symPos * OVERSAMPLE];
+      const bitVal = isSecondBit ? (detectedSym & 1) : ((detectedSym >> 1) & 1);
+      const hardBit = bitVal === 1 ? 1 : -1;
+      dotProduct += hardBit * GOLD_TEMPLATE[k];
+    }
+    corrCurve[lag] = dotProduct;
+    if (dotProduct > bestPeak) {
+      bestPeak = dotProduct;
+      bestLagIdx = lag;
+    }
+  }
+
+  drawCorrelation(corrCurve, bestPeak);
+
+  const bitErrors = Math.round((GOLD_LEN - bestPeak) / 2);
+  document.getElementById('ui-peak').innerText = bestPeak;
+  document.getElementById('ui-errors').innerText = bitErrors >= 0 ? bitErrors : "--";
+
+  const badge = document.getElementById('ui-badge');
+
+  if (bestPeak >= peakThreshold) {
+    validFrames++;
+    let fineLag = bestLagIdx;
+    if (bestLagIdx > 0 && bestLagIdx < maxLagSteps - 1) {
+      const y1 = corrCurve[bestLagIdx - 1];
+      const y2 = corrCurve[bestLagIdx];
+      const y3 = corrCurve[bestLagIdx + 1];
+      const denom = 2 * (y1 - 2 * y2 + y3);
+      if (Math.abs(denom) > 1e-5) {
+        fineLag += Math.max(-0.5, Math.min(0.5, (y1 - y3) / denom));
+      }
+    }
+
+    const framePeriodSec = FRAME_INTERVAL_MS / 1000;
+    const rawTimeSec = (fineLag * hopSize) / actualSampleRate;
+
+    if (rawTimeOffset !== null) {
+      let diff = rawTimeSec - (rawTimeOffset % framePeriodSec);
+      if (diff > framePeriodSec / 2) diff -= framePeriodSec;
+      if (diff < -framePeriodSec / 2) diff += framePeriodSec;
+      rawTimeOffset += diff;
+    } else {
+      rawTimeOffset = rawTimeSec;
+    }
+
+    document.getElementById('ui-lag').innerText = fineLag.toFixed(2);
+
+    if (calibratedT0 === null) {
+      calibratedT0 = rawTimeOffset;
+      calibratedD0 = parseFloat(document.getElementById('input-d0').value) || 30.0;
+    }
+
+    const currentDist = calibratedD0 + SOUND_SPEED * (rawTimeOffset - calibratedT0);
+    
+    // 指数防抖平滑
+    const alpha = 0.2;
+    lastValidDistance = lastValidDistance === null ? currentDist : (alpha * currentDist + (1 - alpha) * lastValidDistance);
+
+    document.getElementById('ui-dist').innerText = lastValidDistance.toFixed(1);
+    badge.innerText = `✅ 序列锁定 (E=${bitErrors})`;
+    badge.className = "status-badge status-valid";
+  } else {
+    badge.innerText = `⚠️ 噪声拦截 (峰值 ${bestPeak} < ${peakThreshold})`;
+    badge.className = "status-badge status-reject";
+  }
+
+  document.getElementById('ui-rate').innerText = `${Math.round((validFrames / totalFrames) * 100)}%`;
+}
+
+function drawCorrelation(curve, peakVal) {
+  const canvas = document.getElementById('corr-canvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width = canvas.clientWidth;
+  const h = canvas.height = canvas.clientHeight;
+
+  ctx.clearRect(0, 0, w, h);
+  const threshY = h - ((peakThreshold + 63) / 126) * h;
+  ctx.strokeStyle = '#ef4444';
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(0, threshY); ctx.lineTo(w, threshY); ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.strokeStyle = peakVal >= peakThreshold ? '#10b981' : '#38bdf8';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < curve.length; i++) {
+    const x = (i / curve.length) * w;
+    const y = h - ((curve[i] + 63) / 126) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+let rxInterval = null;
+async function toggleRX() {
+  const btn = document.getElementById('btn-rx-toggle');
+  if (!isRxRunning) {
+    try {
+      rxStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, sampleRate: SAMPLE_RATE }
+      });
+      rxCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+      const source = rxCtx.createMediaStreamSource(rxStream);
+      rxProcessor = rxCtx.createScriptProcessor(2048, 1, 1);
+      rxProcessor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < input.length; i++) {
+          ringBuffer[ringWritePtr] = input[i];
+          ringWritePtr = (ringWritePtr + 1) % RING_SIZE;
+        }
+      };
+      source.connect(rxProcessor);
+      rxProcessor.connect(rxCtx.destination);
+
+      isRxRunning = true;
+      rxInterval = setInterval(() => processAudioFrame(rxCtx.sampleRate), FRAME_INTERVAL_MS);
+
+      btn.innerText = "停止接收测距";
+      btn.className = "btn btn-stop";
+    } catch (err) {
+      alert("麦克风启动失败: " + err.message);
+    }
+  } else {
+    isRxRunning = false;
+    clearInterval(rxInterval);
+    if (rxProcessor) rxProcessor.disconnect();
+    if (rxStream) rxStream.getTracks().forEach(t => t.stop());
+    if (rxCtx) rxCtx.close();
+    btn.innerText = "启动接收测距";
+    btn.className = "btn btn-start";
+  }
+}
+</script>
+</body>
+</html>
